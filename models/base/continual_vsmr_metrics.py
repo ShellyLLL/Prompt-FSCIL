@@ -128,6 +128,12 @@ def summarize_session_metrics(session_metrics):
         raise ValueError(
             "Session class-average accuracies must be finite fractions in [0,1]."
         )
+    sample_accuracies = [float(item["sample_accuracy"]) for item in records]
+    if not all(
+        np.isfinite(value) and 0.0 <= value <= 1.0
+        for value in sample_accuracies
+    ):
+        raise ValueError("Session sample accuracies must be finite fractions in [0,1].")
     aa = float(np.mean(accuracies))
     pd = float(accuracies[0] - accuracies[-1])
     return {
@@ -141,9 +147,11 @@ def summarize_session_metrics(session_metrics):
         "session_class_average_accuracy_percent": [
             100.0 * value for value in accuracies
         ],
-        "session_sample_accuracy": [
-            float(item["sample_accuracy"]) for item in records
+        "session_sample_accuracy": sample_accuracies,
+        "session_sample_accuracy_percent": [
+            100.0 * value for value in sample_accuracies
         ],
+        "session_ids": actual_sessions,
         "num_sessions": len(records),
         "AA_definition": "Arithmetic mean of all-seen-class macro Top-1 accuracy over S0..ST.",
         "PD_definition": "S0 all-seen-class macro Top-1 accuracy minus ST all-seen-class macro Top-1 accuracy; reported in percentage points.",
@@ -151,24 +159,37 @@ def summarize_session_metrics(session_metrics):
 
 
 def write_session_csv(path, session_metrics):
+    """Write percentage-valued accuracy columns with explicit *_percent names."""
     fields = [
         "session", "seen_classes", "evaluation_samples",
-        "base_class_average_accuracy",
-        "old_seen_class_average_accuracy",
-        "old_novel_class_average_accuracy",
-        "current_new_class_average_accuracy",
-        "class_average_accuracy", "sample_accuracy",
+        "base_class_accuracy_percent",
+        "previously_seen_class_accuracy_percent",
+        "old_novel_class_accuracy_percent",
+        "current_new_class_accuracy_percent",
+        "all_seen_class_macro_accuracy_percent",
+        "sample_top1_accuracy_percent",
     ]
+    source_fields = {
+        "base_class_accuracy_percent": "base_class_average_accuracy",
+        "previously_seen_class_accuracy_percent": "old_seen_class_average_accuracy",
+        "old_novel_class_accuracy_percent": "old_novel_class_average_accuracy",
+        "current_new_class_accuracy_percent": "current_new_class_average_accuracy",
+        "all_seen_class_macro_accuracy_percent": "class_average_accuracy",
+        "sample_top1_accuracy_percent": "sample_accuracy",
+    }
     with open(path, "w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         for item in sorted(session_metrics, key=lambda row: int(row["session"])):
-            row = {key: item.get(key) for key in fields}
-            for key in fields[3:]:
-                value = row[key]
-                row[key] = (
-                    "" if value is None
-                    else "{:.4f}".format(100.0 * float(value))
+            row = {
+                "session": int(item["session"]),
+                "seen_classes": int(item["seen_classes"]),
+                "evaluation_samples": int(item["evaluation_samples"]),
+            }
+            for output_key, source_key in source_fields.items():
+                value = item.get(source_key)
+                row[output_key] = (
+                    "" if value is None else "{:.4f}".format(100.0 * float(value))
                 )
             writer.writerow(row)
 
