@@ -1,7 +1,5 @@
 """Auditable session-wise FSCIL accuracy and AA/PD calculations."""
 import csv
-import json
-import os
 
 import numpy as np
 import torch
@@ -14,17 +12,31 @@ def _as_long_tensor(values):
 def class_accuracy_map(labels, predictions, class_ids):
     labels = _as_long_tensor(labels)
     predictions = _as_long_tensor(predictions)
+    class_ids = [int(value) for value in class_ids]
+    if not class_ids or len(set(class_ids)) != len(class_ids):
+        raise ValueError("class_ids must be a non-empty sequence of unique IDs.")
     if labels.numel() != predictions.numel() or labels.numel() == 0:
         raise ValueError("Labels and predictions must be non-empty and aligned.")
+    expected = set(class_ids)
+    observed_labels = set(labels.tolist())
+    observed_predictions = set(predictions.tolist())
+    if observed_labels != expected:
+        raise RuntimeError(
+            "Evaluation labels must contain exactly the expected classes; "
+            "expected {}, observed {}.".format(sorted(expected), sorted(observed_labels))
+        )
+    invalid_predictions = observed_predictions - expected
+    if invalid_predictions:
+        raise RuntimeError(
+            "Predictions contain class IDs outside the evaluated class set: {}."
+            .format(sorted(invalid_predictions))
+        )
     result = {}
     for class_id in class_ids:
-        class_id = int(class_id)
         mask = labels == class_id
-        if not bool(mask.any()):
-            raise RuntimeError(
-                "Evaluation is missing expected class {}.".format(class_id)
-            )
-        result[class_id] = float((predictions[mask] == labels[mask]).float().mean())
+        result[class_id] = float(
+            (predictions[mask] == labels[mask]).float().mean()
+        )
     return result
 
 
@@ -36,7 +48,11 @@ def mean_class_accuracy(labels, predictions, class_ids):
 def evaluate_session_predictions(
     labels, predictions, base_class, seen_classes, session, way
 ):
-    """Return macro class accuracies, sample accuracy and a full confusion matrix."""
+    """Evaluate exactly the classes seen at this Session.
+
+    Class-average accuracy is the unweighted mean of per-class top-1 accuracy.
+    Sample accuracy is reported separately and is never substituted for AA/PD.
+    """
     labels = _as_long_tensor(labels)
     predictions = _as_long_tensor(predictions)
     base_class = int(base_class)
@@ -45,14 +61,19 @@ def evaluate_session_predictions(
     way = int(way)
     if labels.numel() != predictions.numel() or labels.numel() == 0:
         raise ValueError("Evaluation labels and predictions must be non-empty.")
-    if session < 0 or base_class < 1 or seen_classes < base_class or way < 1:
+    if session < 0 or base_class < 1 or way < 1:
         raise ValueError("Invalid session/class configuration.")
+    expected_seen = base_class + session * way
+    if seen_classes != expected_seen:
+        raise ValueError(
+            "Session {} must evaluate exactly {} seen classes, got {}."
+            .format(session, expected_seen, seen_classes)
+        )
+
     expected = list(range(seen_classes))
     per_class = class_accuracy_map(labels, predictions, expected)
 
     current_start = base_class + (session - 1) * way if session > 0 else base_class
-    if current_start > seen_classes:
-        raise ValueError("Current-session class range exceeds seen classes.")
     old_seen_ids = list(range(current_start))
     base_ids = list(range(base_class))
     old_novel_ids = list(range(base_class, current_start))
@@ -61,20 +82,14 @@ def evaluate_session_predictions(
     def group_accuracy(ids):
         if not ids:
             return None
-        missing = [class_id for class_id in ids if class_id not in per_class]
-        if missing:
-            raise RuntimeError("Missing classes in accuracy group: {}".format(missing))
         return float(np.mean([per_class[class_id] for class_id in ids]))
 
+    # Bounds and exact label coverage have already been checked above, so
+    # bincount cannot silently clamp invalid predictions into the last class.
+    encoded = labels * seen_classes + predictions
     confusion = torch.bincount(
-        labels * seen_classes + predictions.clamp(min=0, max=seen_classes - 1),
-        minlength=seen_classes * seen_classes,
+        encoded, minlength=seen_classes * seen_classes
     ).reshape(seen_classes, seen_classes)
-
-    if torch.any(labels < 0) or torch.any(labels >= seen_classes):
-        raise RuntimeError("Evaluation labels fall outside the seen class range.")
-    if torch.any(predictions < 0) or torch.any(predictions >= seen_classes):
-        raise RuntimeError("Predictions fall outside the seen class range.")
 
     return {
         "session": session,
@@ -94,7 +109,7 @@ def evaluate_session_predictions(
 
 
 def summarize_session_metrics(session_metrics):
-    """AA is the mean of session macro accuracies; PD is A0 minus AT."""
+    """AA = mean S0..ST macro accuracy; PD = S0 macro accuracy - ST macro accuracy."""
     records = sorted(session_metrics, key=lambda item: int(item["session"]))
     if not records:
         raise ValueError("At least one evaluated session is required.")
@@ -102,13 +117,17 @@ def summarize_session_metrics(session_metrics):
     actual_sessions = [int(item["session"]) for item in records]
     if actual_sessions != expected_sessions:
         raise RuntimeError(
-            "Session metrics must contain exactly S0..ST; got {}".format(
-                actual_sessions
-            )
+            "Session metrics must contain exactly S0..ST; got {}"
+            .format(actual_sessions)
         )
     accuracies = [float(item["class_average_accuracy"]) for item in records]
-    if not all(np.isfinite(value) and 0.0 <= value <= 1.0 for value in accuracies):
-        raise ValueError("Session class-average accuracies must be finite fractions.")
+    if not all(
+        np.isfinite(value) and 0.0 <= value <= 1.0
+        for value in accuracies
+    ):
+        raise ValueError(
+            "Session class-average accuracies must be finite fractions in [0,1]."
+        )
     aa = float(np.mean(accuracies))
     pd = float(accuracies[0] - accuracies[-1])
     return {
@@ -126,6 +145,8 @@ def summarize_session_metrics(session_metrics):
             float(item["sample_accuracy"]) for item in records
         ],
         "num_sessions": len(records),
+        "AA_definition": "Arithmetic mean of all-seen-class macro Top-1 accuracy over S0..ST.",
+        "PD_definition": "S0 all-seen-class macro Top-1 accuracy minus ST all-seen-class macro Top-1 accuracy; reported in percentage points.",
     }
 
 
@@ -145,7 +166,10 @@ def write_session_csv(path, session_metrics):
             row = {key: item.get(key) for key in fields}
             for key in fields[3:]:
                 value = row[key]
-                row[key] = "" if value is None else "{:.4f}".format(100.0 * float(value))
+                row[key] = (
+                    "" if value is None
+                    else "{:.4f}".format(100.0 * float(value))
+                )
             writer.writerow(row)
 
 
@@ -158,18 +182,19 @@ def write_confusion_csv(path, confusion):
 
 def format_session_table(session_metrics):
     rows = [
-        "Session | Seen | Base | Old novel | Current new | All-seen macro | Sample Top-1",
-        "-------:|-----:|-----:|----------:|------------:|---------------:|------------:",
+        "Session | Seen | Base | Previously seen | Old novel | Current new | All-seen macro | Sample Top-1",
+        "-------:|-----:|-----:|---------------:|----------:|------------:|---------------:|------------:",
     ]
     for item in sorted(session_metrics, key=lambda row: int(row["session"])):
         def pct(key):
             value = item.get(key)
             return "--" if value is None else "{:.2f}%".format(100.0 * float(value))
         rows.append(
-            "S{session} | {seen} | {base} | {old_novel} | {new} | {macro} | {sample}".format(
+            "S{session} | {seen} | {base} | {old_seen} | {old_novel} | {new} | {macro} | {sample}".format(
                 session=int(item["session"]),
                 seen=int(item["seen_classes"]),
                 base=pct("base_class_average_accuracy"),
+                old_seen=pct("old_seen_class_average_accuracy"),
                 old_novel=pct("old_novel_class_average_accuracy"),
                 new=pct("current_new_class_average_accuracy"),
                 macro=pct("class_average_accuracy"),
@@ -179,13 +204,14 @@ def format_session_table(session_metrics):
     summary = summarize_session_metrics(session_metrics)
     rows.append("")
     rows.append(
-        "AA = {:.2f}% (mean of S0..ST macro accuracies)".format(
-            summary["AA_percent"]
-        )
+        "AA = {:.2f}% (arithmetic mean of S0..ST all-seen-class macro accuracy)"
+        .format(summary["AA_percent"])
     )
     rows.append(
-        "PD = {:.2f} percentage points (S0 macro - ST macro)".format(
-            summary["PD_percentage_points"]
-        )
+        "PD = {:.2f} percentage points (S0 macro accuracy - ST macro accuracy)"
+        .format(summary["PD_percentage_points"])
+    )
+    rows.append(
+        "Sample-weighted Top-1 is reported separately and is not used for AA/PD."
     )
     return "\n".join(rows)
