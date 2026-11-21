@@ -1,9 +1,12 @@
 import unittest
+import tempfile
+import os
 import torch
 import torch.nn as nn
 from types import SimpleNamespace
 
 from models.base.continual_vsmr_model import ContinualVSMRViT
+from models.base.continual_vsmr_trainer import ContinualVSMRFSCILTrainer
 from models.base.vsmr_modules import QueryConditionedReconstructor, VisualSemanticDecomposer
 from models.base.vsmr_losses import sinkhorn_transport, ot_distance
 from models.base.vsmr_resynthesis import query_conditioned_reconstruction
@@ -47,6 +50,105 @@ class DummyViTEncoder(nn.Module):
         tokens = torch.cat([self.cls_token.expand(patches.shape[0], -1, -1), patches], dim=1)
         return self.pos_drop(tokens + self.pos_embed)
 
+
+
+class TinyImageDataset(torch.utils.data.Dataset):
+    def __init__(self, labels, seed):
+        self.targets = list(labels)
+        self.transform = lambda image: image
+        generator = torch.Generator().manual_seed(seed)
+        self.images = [torch.randn(3, 224, 224, generator=generator) for _ in labels]
+
+    def __len__(self):
+        return len(self.targets)
+
+    def __getitem__(self, index):
+        return self.images[index], self.targets[index]
+
+
+class TestContinualVSMRTrainingPipeline(unittest.TestCase):
+    def test_synthetic_base_incremental_evaluation_and_complete_report(self):
+        torch.manual_seed(21)
+        args = SimpleNamespace(
+            base_class=2, way=2, shot=2, sessions=2,
+            epochs_base=1, epochs_new=1,
+            num_workers=0, test_batch_size=8,
+            vsmr_classes_per_batch=2, vsmr_samples_per_class=2,
+            continual_classes_per_batch=2, continual_samples_per_class=2,
+            continual_base_memory_per_class=2,
+            vsmr_lr=1e-3, vsmr_weight_decay=0.0,
+            continual_prompt_lr=1e-3, continual_prompt_weight_decay=0.0,
+            vsmr_ot_epsilon=0.1, vsmr_sinkhorn_iterations=15,
+            vsmr_barycenter_iterations=2, vsmr_logit_scale=4.0,
+            vsmr_local_weight=1.0, vsmr_joint_weight=1.0,
+            continual_local_weight=1.0, continual_joint_weight=1.0,
+            continual_history_consistency_weight=0.1,
+        )
+        trainer = ContinualVSMRFSCILTrainer.__new__(ContinualVSMRFSCILTrainer)
+        trainer.args = args
+        trainer.device = torch.device("cpu")
+        trainer.seed = 21
+        trainer.model = ContinualVSMRViT(
+            SimpleNamespace(
+                scratch=False, vsmr_num_parts=3,
+                vsmr_prompt_temperature=1.0,
+                vsmr_global_weight=0.5,
+                vsmr_local_weight_eval=0.5,
+            ),
+            encoder=DummyViTEncoder(),
+        )
+        trainer.epsilon = 0.1
+        trainer.sinkhorn_steps = 15
+        trainer.barycenter_steps = 2
+        trainer.logit_scale = 4.0
+        trainer.memory_per_base_class = 2
+        trainer.memory = FrozenFeatureMemory(2)
+        trainer.base_reference = {}
+        trainer.previous_reference = {}
+        trainer.global_prototypes = None
+        trainer.local_prototypes = None
+        trainer.classes = None
+        trainer.session_records = []
+        trainer.confusion_matrices = {}
+        trainer._train_transform = lambda: None
+        trainer._eval_transform = lambda: None
+        trainer._append_log = lambda record: None
+
+        with tempfile.TemporaryDirectory() as directory:
+            trainer.save_dir = directory
+            base = TinyImageDataset([0, 0, 0, 1, 1, 1], seed=22)
+            trainer._train_base(base)
+            self.assertEqual(len(trainer.memory), 4)
+            self.assertEqual(trainer.classes.tolist(), [0, 1])
+            self.assertEqual(trainer.global_prototypes.shape, (2, 8))
+            self.assertEqual(trainer.local_prototypes.shape, (2, 3, 8))
+            trainer._evaluate(TinyImageDataset([0, 1], seed=23), 0)
+
+            support = TinyImageDataset([2, 2, 3, 3], seed=24)
+            trainer._incremental_session(support, 1)
+            self.assertEqual(len(trainer.memory), 8)
+            self.assertEqual(trainer.classes.tolist(), [0, 1, 2, 3])
+            self.assertEqual(trainer.global_prototypes.shape, (4, 8))
+            self.assertEqual(trainer.local_prototypes.shape, (4, 3, 8))
+            self.assertEqual(
+                [name for name, parameter in trainer.model.named_parameters() if parameter.requires_grad],
+                ["decomposer.shared_prompts"],
+            )
+            trainer._evaluate(TinyImageDataset([0, 1, 2, 3], seed=25), 1)
+            summary = trainer._write_final_report(1.0)
+            self.assertEqual(summary["num_sessions"], 2)
+            self.assertAlmostEqual(
+                summary["AA"],
+                sum(summary["session_class_average_accuracy"]) / 2.0,
+            )
+            self.assertAlmostEqual(
+                summary["PD"],
+                summary["session_class_average_accuracy"][0]
+                - summary["session_class_average_accuracy"][1],
+            )
+            self.assertTrue(os.path.isfile(os.path.join(directory, "session_metrics.csv")))
+            self.assertTrue(os.path.isfile(os.path.join(directory, "summary.json")))
+            self.assertTrue(os.path.isfile(os.path.join(directory, "continual_vsmr_final.pth")))
 
 class TestContinualVSMRArchitecture(unittest.TestCase):
     def test_frozen_backbone_and_prompt_only_incremental_gradient(self):
