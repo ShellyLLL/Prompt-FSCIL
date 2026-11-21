@@ -64,6 +64,10 @@ class ContinualVSMRViT(nn.Module):
         """Freeze all learned modules except the shared Prompt matrix."""
         self._incremental_prompt_only = True
         for parameter in self.parameters():
+            # Base optimizer gradients may still be attached after its final
+            # step. Freeze must clear them so incremental checks observe only
+            # gradients created by the Prompt-only objective.
+            parameter.grad = None
             parameter.requires_grad_(False)
         self.decomposer.shared_prompts.requires_grad_(True)
         self.eval()
