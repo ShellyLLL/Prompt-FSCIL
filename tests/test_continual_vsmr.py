@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from models.base.continual_vsmr_model import ContinualVSMRViT
 from models.base.vsmr_modules import QueryConditionedReconstructor, VisualSemanticDecomposer
 from models.base.vsmr_losses import sinkhorn_transport, ot_distance
+from models.base.vsmr_resynthesis import query_conditioned_reconstruction
 
 from models.base.continual_vsmr import (
     FrozenFeatureMemory, loo_class_prototypes, prompt_consistency_loss,
