@@ -10,7 +10,6 @@ from models.base.vsmr_resynthesis import query_conditioned_reconstruction
 
 from models.base.continual_vsmr import (
     FrozenFeatureMemory, loo_class_prototypes, prompt_consistency_loss,
-    distillation_kl,
 )
 
 
