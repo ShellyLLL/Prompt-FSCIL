@@ -2,7 +2,7 @@ name: VSMR architecture tests
 
 on:
   push:
-    branches: [dev]
+    branches: [dev, feature/continual-vsmr-peft]
   pull_request:
     branches: [dev]
 
@@ -23,6 +23,6 @@ jobs:
           python -m pip install timm==0.6.12 numpy==1.26.4 pillow tqdm
       - name: Compile VSMR implementation
         run: |
-          python -m py_compile train.py models/base/vsmr_modules.py models/base/vsmr_losses.py models/base/vsmr_resynthesis.py models/base/vsmr_trainer.py
+          python -m py_compile train.py models/base/continual_vsmr.py models/base/continual_vsmr_metrics.py models/base/continual_vsmr_model.py models/base/continual_vsmr_trainer.py models/base/vsmr_modules.py models/base/vsmr_losses.py models/base/vsmr_resynthesis.py
       - name: Run VSMR tests
-        run: python -m unittest discover -s tests -p 'test_vsmr.py' -v
+        run: python -m unittest discover -s tests -p 'test_continual_vsmr*.py' -v
