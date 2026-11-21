@@ -480,8 +480,6 @@ class ContinualVSMRFSCILTrainer:
             self.global_prototypes,
             torch.stack(new_global_prototypes),
         ], dim=0)
-        _, _, _, previous_parts = self._prototype_bank(cls, patches, labels)
-        previous_parts = previous_parts.detach()
         previous_prompt = self.model.decomposer.shared_prompts.detach().clone()
         prompt = self.model.decomposer.shared_prompts
         self.model.assert_incremental_parameter_contract()
@@ -530,9 +528,8 @@ class ContinualVSMRFSCILTrainer:
                 query_labels = labels[indices]
                 output = self.model.decompose_features(query_cls, query_patches)
 
-                all_classes, _, _, all_parts = self._prototype_bank(
-                    cls, patches, labels
-                )
+                all_classes = torch.unique(labels, sorted=True)
+                all_parts = self._current_parts(cls, patches)[1]
                 candidate_parts = loo_class_prototypes(
                     all_parts, labels, indices, all_classes,
                     self.epsilon, self.sinkhorn_steps, self.barycenter_steps,
