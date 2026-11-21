@@ -124,6 +124,8 @@ class CUB200(Dataset):
         data_tmp = []
         targets_tmp = []
         missing = []
+        seen_paths = set()
+        duplicates = []
         for raw_line in open(index_path, "r", encoding="utf-8"):
             item = raw_line.strip().replace("\\\\", "/")
             if not item:
@@ -156,6 +158,10 @@ class CUB200(Dataset):
             if resolved is None or resolved not in data2label:
                 missing.append(item)
                 continue
+            if resolved in seen_paths:
+                duplicates.append(item)
+                continue
+            seen_paths.add(resolved)
 
             data_tmp.append(resolved)
             targets_tmp.append(int(data2label[resolved]))
@@ -165,6 +171,11 @@ class CUB200(Dataset):
             raise RuntimeError(
                 "CUB session index {} contains {} unresolved image paths. "
                 "Examples: {}".format(index_path, len(missing), preview)
+            )
+        if duplicates:
+            raise RuntimeError(
+                "CUB session index {} contains {} duplicate image paths. "
+                "Examples: {}".format(index_path, len(duplicates), ", ".join(duplicates[:5]))
             )
         if not data_tmp:
             raise RuntimeError("CUB session index is empty: {}".format(index_path))
