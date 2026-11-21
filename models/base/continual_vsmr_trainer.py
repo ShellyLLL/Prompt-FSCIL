@@ -263,8 +263,10 @@ class ContinualVSMRFSCILTrainer:
         return F.normalize(self.model.decomposer.global_projection(cls_features), dim=-1)
 
     def _current_parts(self, cls_features, patches):
-        output = decompose_cached(self.model, cls_features, patches)
-        return output["global_features"], output["parts"]
+        global_features, parts, _ = decompose_cached(
+            self.model, cls_features, patches
+        )
+        return global_features, parts
 
     def _prototype_bank(self, cls_features, patch_features, labels):
         global_features, parts = self._current_parts(cls_features, patch_features)
