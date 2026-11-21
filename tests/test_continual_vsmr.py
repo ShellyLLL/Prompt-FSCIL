@@ -169,7 +169,11 @@ class TestContinualVSMRArchitecture(unittest.TestCase):
         self.assertFalse(any(p.requires_grad for p in model.backbone.parameters()))
         self.assertTrue(torch.isfinite(output["parts"]).all())
 
+        # Simulate gradients left by the final Base optimizer step.
+        (output["parts"] * torch.randn_like(output["parts"])).sum().backward()
+        self.assertIsNotNone(model.decomposer.query_projection.weight.grad)
         model.freeze_for_incremental()
+        self.assertTrue(all(parameter.grad is None for parameter in model.parameters()))
         model.train()
         self.assertFalse(model.backbone.training)
         self.assertFalse(model.decomposer.training)
