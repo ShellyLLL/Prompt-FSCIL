@@ -4,7 +4,6 @@ Base learns the full visual decomposition/reconstruction model on real base
 images. Each incremental session updates only the fixed shared Prompt using
 real K-shot support features and replayed frozen CLS/Patch feature memory.
 """
-import csv
 import json
 import os
 import random
@@ -22,7 +21,6 @@ from .continual_vsmr import (
     FrozenFeatureMemory,
     loo_class_prototypes,
     prompt_consistency_loss,
-    distillation_kl,
     decompose_cached,
 )
 from .continual_vsmr_model import ContinualVSMRViT
@@ -450,34 +448,39 @@ class ContinualVSMRFSCILTrainer:
             raise RuntimeError("Session {} support classes mismatch: {}".format(session, counts))
         if any(value != int(self.args.shot) for value in counts.values()):
             raise RuntimeError("Session {} requires exact K-shot: {}".format(session, counts))
-        old_memory_size = len(self.memory)
+
+        previous_memory_size = len(self.memory)
         self._append_dataset_to_memory(support_set, session, is_base=False)
-        if len(self.memory) - old_memory_size != int(self.args.way) * int(self.args.shot):
+        expected_added = int(self.args.way) * int(self.args.shot)
+        if len(self.memory) - previous_memory_size != expected_added:
             raise RuntimeError("Incremental memory did not append exactly the K-shot samples.")
 
         cls, patches, labels = self._all_memory()
-        _, _, _, teacher_parts = self._prototype_bank(cls, patches, labels)
-        teacher_prompt = self.model.decomposer.shared_prompts.detach().clone()
-        previous_parts = teacher_parts.detach()
-        previous_reference = {
-            record.sample_id: previous_parts[index].detach().cpu().clone()
-            for index, record in enumerate(self.memory.records)
-        }
-        old_classes = torch.arange(int(self.args.base_class) + (session - 1) * int(self.args.way),
-                                   device=self.device)
-        old_mask = torch.isin(labels, old_classes)
-        old_indices = torch.nonzero(old_mask, as_tuple=False).flatten()
-        old_cls = cls[old_indices]
-        old_patches = patches[old_indices]
-        old_labels = labels[old_indices]
-        old_parts = previous_parts[old_indices]
-        old_ids = [self.memory.records[int(i)].sample_id for i in old_indices.cpu().tolist()]
-        old_base_mask = old_labels < int(self.args.base_class)
-        old_inc_mask = ~old_base_mask
-
-        self.model.assert_incremental_parameter_contract()
+        _, _, _, previous_parts = self._prototype_bank(cls, patches, labels)
+        previous_parts = previous_parts.detach()
+        previous_prompt = self.model.decomposer.shared_prompts.detach().clone()
         prompt = self.model.decomposer.shared_prompts
-        previous_prompt = teacher_prompt.to(self.device)
+        self.model.assert_incremental_parameter_contract()
+
+        # Historical references are immutable and exist only for samples admitted
+        # before this Session. New support samples acquire references after training.
+        historical_count = previous_memory_size
+        reference_parts = []
+        reference_indices = []
+        for index in range(historical_count):
+            record = self.memory.records[index]
+            if record.sample_id not in self.base_reference and record.sample_id not in self.previous_reference:
+                raise RuntimeError("Missing permanent historical reference: " + record.sample_id)
+            reference = (
+                self.base_reference[record.sample_id]
+                if record.sample_id in self.base_reference
+                else self.previous_reference[record.sample_id]
+            )
+            reference_parts.append(reference.to(self.device))
+            reference_indices.append(index)
+        reference_parts = torch.stack(reference_parts)
+        reference_indices = torch.tensor(reference_indices, dtype=torch.long, device=self.device)
+
         optimizer = torch.optim.AdamW(
             [prompt],
             lr=float(getattr(self.args, "continual_prompt_lr", 1e-4)),
@@ -486,121 +489,63 @@ class ContinualVSMRFSCILTrainer:
         epochs = int(getattr(self.args, "epochs_new", 20))
         w_local = float(getattr(self.args, "continual_local_weight", 1.0))
         w_joint = float(getattr(self.args, "continual_joint_weight", 1.0))
-        w_prev = float(getattr(self.args, "continual_previous_consistency_weight", 0.1))
-        w_base = float(getattr(self.args, "continual_base_consistency_weight", 0.1))
-        w_kd = float(getattr(self.args, "continual_distillation_weight", 0.5))
-        w_anchor = float(getattr(self.args, "continual_prompt_anchor_weight", 1e-3))
-        w_overlap = float(getattr(self.args, "vsmr_overlap_weight", 0.01))
-        temperature = float(getattr(self.args, "continual_distillation_temperature", 2.0))
+        w_history = float(getattr(self.args, "continual_history_consistency_weight", 0.1))
         classes_per_batch = int(getattr(self.args, "continual_classes_per_batch", 16))
         samples_per_class = int(getattr(self.args, "continual_samples_per_class", 4))
 
-        # Previous-session teacher outputs are fixed for this Session.
-        with torch.no_grad():
-            old_teacher_parts = old_parts
-            old_teacher_local, _, _, _ = query_conditioned_reconstruction(
-                old_parts, old_patches,
-                self._prototype_bank(cls, patches, labels)[2][old_classes],
-                self.model.reconstructor, self.epsilon, self.sinkhorn_steps,
-                self.logit_scale,
-            ) if False else (None, None, None, None)
-
         for epoch in range(epochs):
             self.model.train()
-            totals = {key: 0.0 for key in (
-                "total", "local", "joint", "previous_consistency",
-                "base_consistency", "distillation", "anchor", "overlap",
-            )}
+            totals = {"total": 0.0, "local": 0.0, "joint": 0.0, "history": 0.0}
             steps = 0
             for indices in self._balanced_memory_indices(
                 labels, classes_per_batch, samples_per_class,
                 epoch + session * epochs
             ):
-                q_cls, q_patches, q_labels = cls[indices], patches[indices], labels[indices]
-                output = self.model.decompose_features(q_cls, q_patches)
-                all_global = self._global_features(cls)
-                all_classes, all_global_proto, all_local_proto, all_parts = self._prototype_bank(
+                query_cls = cls[indices]
+                query_patches = patches[indices]
+                query_labels = labels[indices]
+                output = self.model.decompose_features(query_cls, query_patches)
+
+                all_classes, all_global, _, all_parts = self._prototype_bank(
                     cls, patches, labels
                 )
                 candidate_parts = loo_class_prototypes(
                     all_parts, labels, indices, all_classes,
                     self.epsilon, self.sinkhorn_steps, self.barycenter_steps,
                 )
-                global_scores_full = global_logits(
-                    output["global_features"], all_global_proto, self.logit_scale
+                global_scores = global_logits(
+                    output["global_features"], all_global, self.logit_scale
                 )
                 local_scores, _, _, _ = query_conditioned_reconstruction(
-                    output["parts"], q_patches, candidate_parts,
+                    output["parts"], query_patches, candidate_parts,
                     self.model.reconstructor, self.epsilon,
                     self.sinkhorn_steps, self.logit_scale,
                 )
-                joint_scores = self.model.fusion(global_scores_full, local_scores)
-                target_map = {int(c): i for i, c in enumerate(all_classes.tolist())}
+                joint_scores = self.model.fusion(global_scores, local_scores)
+                class_to_column = {
+                    int(class_id): position
+                    for position, class_id in enumerate(all_classes.tolist())
+                }
                 targets = torch.tensor(
-                    [target_map[int(v)] for v in q_labels.tolist()],
-                    dtype=torch.long, device=self.device
+                    [class_to_column[int(label)] for label in query_labels.tolist()],
+                    dtype=torch.long, device=self.device,
                 )
                 local_loss = F.cross_entropy(local_scores, targets)
                 joint_loss = F.cross_entropy(joint_scores, targets)
 
-                old_batch = torch.isin(q_labels, old_classes)
-                prev_consistency = prompt_consistency_loss(
-                    output["parts"][old_batch],
-                    previous_parts[indices][old_batch],
-                    epsilon=self.epsilon, iterations=self.sinkhorn_steps,
+                # Re-decompose historical replay features in the student Prompt
+                # and compare them to their immutable first-admission references.
+                history_parts = all_parts[reference_indices]
+                history_loss = prompt_consistency_loss(
+                    history_parts,
+                    reference_parts,
+                    epsilon=self.epsilon,
+                    iterations=self.sinkhorn_steps,
                 )
-                base_batch = old_batch & (q_labels < int(self.args.base_class))
-                base_consistency = prompt_consistency_loss(
-                    output["parts"][base_batch],
-                    torch.stack([
-                        self.base_reference[self.memory.records[int(i)].sample_id].to(self.device)
-                        for i in indices[base_batch].cpu().tolist()
-                    ]) if bool(base_batch.any()) else output["parts"][base_batch].detach(),
-                    epsilon=self.epsilon, iterations=self.sinkhorn_steps,
-                )
-                anchor_loss = (prompt - previous_prompt).square().mean()
-
-                # Distill old-class predictions with a frozen previous Prompt.
-                old_query = torch.nonzero(old_batch, as_tuple=False).flatten()
-                if old_query.numel() > 0 and old_classes.numel() > 0:
-                    with torch.no_grad():
-                        teacher_output = self.model.decompose_features(
-                            q_cls[old_query], q_patches[old_query]
-                        )
-                        teacher_all_parts = previous_parts
-                        teacher_prototypes = []
-                        for old_class in old_classes.tolist():
-                            mask = labels == int(old_class)
-                            teacher_prototypes.append(ot_barycenter(
-                                teacher_all_parts[mask], self.epsilon,
-                                self.sinkhorn_steps, self.barycenter_steps
-                            ))
-                        teacher_prototypes = torch.stack(teacher_prototypes)
-                        teacher_local, _, _, _ = query_conditioned_reconstruction(
-                            teacher_output["parts"], q_patches[old_query],
-                            teacher_prototypes, self.model.reconstructor,
-                            self.epsilon, self.sinkhorn_steps, self.logit_scale,
-                        )
-                        teacher_global = global_logits(
-                            teacher_output["global_features"],
-                            self.global_prototypes[:old_classes.numel()],
-                            self.logit_scale,
-                        )
-                        teacher_joint = self.model.fusion(teacher_global, teacher_local)
-                    student_joint_old = joint_scores[old_query, :old_classes.numel()]
-                    teacher_joint_old = teacher_joint
-                    kd_loss = distillation_kl(
-                        student_joint_old, teacher_joint_old, temperature
-                    )
-                else:
-                    kd_loss = joint_loss * 0.0
-
-                overlap_loss = attention_overlap_loss(output["attention"])
                 loss = (
-                    w_local * local_loss + w_joint * joint_loss
-                    + w_prev * prev_consistency + w_base * base_consistency
-                    + w_kd * kd_loss + w_anchor * anchor_loss
-                    + w_overlap * overlap_loss
+                    w_local * local_loss
+                    + w_joint * joint_loss
+                    + w_history * history_loss
                 )
                 if not torch.isfinite(loss):
                     raise FloatingPointError("Non-finite incremental loss.")
@@ -612,13 +557,11 @@ class ContinualVSMRFSCILTrainer:
                     if name != "decomposer.shared_prompts" and parameter.grad is not None:
                         raise RuntimeError("Frozen parameter received gradient: " + name)
                 optimizer.step()
-                for key, value in {
-                    "total": loss, "local": local_loss, "joint": joint_loss,
-                    "previous_consistency": prev_consistency,
-                    "base_consistency": base_consistency, "distillation": kd_loss,
-                    "anchor": anchor_loss, "overlap": overlap_loss,
-                }.items():
-                    totals[key] += float(value.detach())
+
+                totals["total"] += float(loss.detach())
+                totals["local"] += float(local_loss.detach())
+                totals["joint"] += float(joint_loss.detach())
+                totals["history"] += float(history_loss.detach())
                 steps += 1
 
             record = {"stage": "incremental_train", "session": session, "epoch": epoch + 1}
@@ -628,22 +571,25 @@ class ContinualVSMRFSCILTrainer:
             )
             self._append_log(record)
 
-        # Permanent Base references are immutable. Newly admitted class references
-        # are established only after this Session has finished training.
+        # Recompute every seen-class prototype in the current Prompt space.
+        # Historical references remain untouched; only this Session's samples
+        # receive their first and permanent component references.
         with torch.no_grad():
-            _, _, _, final_parts = self._prototype_bank(cls, patches, labels)
-            for index, memory_record in enumerate(self.memory.records):
-                if memory_record.label >= int(self.args.base_class) + (session - 1) * int(self.args.way):
-                    if memory_record.label < int(self.args.base_class) + session * int(self.args.way):
-                        self.previous_reference[memory_record.sample_id] = final_parts[index].cpu().clone()
-            self.classes, self.global_prototypes, self.local_prototypes = (
-                self._prototype_bank(cls, patches, labels)[:3]
+            self.classes, self.global_prototypes, self.local_prototypes, final_parts = (
+                self._prototype_bank(cls, patches, labels)
             )
+            for index in range(previous_memory_size, len(self.memory)):
+                sample_id = self.memory.records[index].sample_id
+                self.previous_reference[sample_id] = final_parts[index].cpu().clone()
+
         self._append_log({
-            "stage": "memory_update", "session": session,
+            "stage": "memory_update",
+            "session": session,
             "memory_samples": len(self.memory),
             "classes": int(self.classes.numel()),
             "prompt_delta_from_previous": float((prompt.detach() - previous_prompt).norm()),
+            "historical_reference_count": historical_count,
+            "new_reference_count": len(self.memory) - previous_memory_size,
         })
 
     @torch.no_grad()
