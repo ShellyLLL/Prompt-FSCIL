@@ -664,6 +664,15 @@ class ContinualVSMRFSCILTrainer:
         return metrics
 
     def _write_final_report(self, elapsed):
+        expected_sessions = int(self.args.sessions)
+        actual_sessions = len(self.session_records)
+        if actual_sessions != expected_sessions:
+            raise RuntimeError(
+                "Refusing to report partial FSCIL metrics: expected {} sessions "
+                "(S0..S{}), but evaluated {}.".format(
+                    expected_sessions, expected_sessions - 1, actual_sessions
+                )
+            )
         summary = summarize_session_metrics(self.session_records)
         summary.update({
             "stage": "summary",
