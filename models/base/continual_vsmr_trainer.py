@@ -226,6 +226,7 @@ class ContinualVSMRFSCILTrainer:
 
     def _append_dataset_to_memory(self, dataset, session, is_base=False):
         cls, patches, labels, indices = self._extract_dataset(dataset)
+        full_cls, full_patches, full_labels = cls, patches, labels
         if is_base:
             # Deterministic, reproducible class-balanced exemplars; never use test data.
             selected = []
@@ -251,6 +252,8 @@ class ContinualVSMRFSCILTrainer:
             ["session{}:index{}".format(session, i) for i in indices],
             session, is_base=is_base,
         )
+        if is_base:
+            return full_cls, full_patches, full_labels
         return cls, patches, labels
 
     def _all_memory(self):
@@ -379,9 +382,17 @@ class ContinualVSMRFSCILTrainer:
             trainset, 0, is_base=True
         )
         cls, patches, labels = self._all_memory()
-        self.classes, self.global_prototypes, self.local_prototypes, base_parts = (
+        self.classes, _, self.local_prototypes, base_parts = (
             self._prototype_bank(cls, patches, labels)
         )
+        # Base global prototypes use every real Base training image, while the
+        # local OT memory uses the deterministic per-class feature budget.
+        base_global_features = self._global_features(base_cls.to(self.device))
+        base_global_labels = base_labels.to(self.device)
+        self.global_prototypes = torch.stack([
+            F.normalize(base_global_features[base_global_labels == class_id].mean(0), dim=-1)
+            for class_id in range(int(self.args.base_class))
+        ]).detach()
         self.base_reference = {
             record.sample_id: part.detach().cpu().clone()
             for record, part in zip(self.memory.records, base_parts)
@@ -456,6 +467,22 @@ class ContinualVSMRFSCILTrainer:
             raise RuntimeError("Incremental memory did not append exactly the K-shot samples.")
 
         cls, patches, labels = self._all_memory()
+        # Add only the current K-shot classes to the immutable global prototype
+        # bank. Previously admitted global prototypes are never recomputed.
+        new_global_features = self._global_features(
+            cls[previous_memory_size:]
+        )
+        new_global_labels = labels[previous_memory_size:]
+        new_global_prototypes = []
+        for class_id in expected.tolist():
+            mask = new_global_labels == int(class_id)
+            new_global_prototypes.append(
+                F.normalize(new_global_features[mask].mean(0), dim=-1)
+            )
+        self.global_prototypes = torch.cat([
+            self.global_prototypes,
+            torch.stack(new_global_prototypes),
+        ], dim=0)
         _, _, _, previous_parts = self._prototype_bank(cls, patches, labels)
         previous_parts = previous_parts.detach()
         previous_prompt = self.model.decomposer.shared_prompts.detach().clone()
@@ -506,7 +533,7 @@ class ContinualVSMRFSCILTrainer:
                 query_labels = labels[indices]
                 output = self.model.decompose_features(query_cls, query_patches)
 
-                all_classes, all_global, _, all_parts = self._prototype_bank(
+                all_classes, _, _, all_parts = self._prototype_bank(
                     cls, patches, labels
                 )
                 candidate_parts = loo_class_prototypes(
@@ -514,7 +541,7 @@ class ContinualVSMRFSCILTrainer:
                     self.epsilon, self.sinkhorn_steps, self.barycenter_steps,
                 )
                 global_scores = global_logits(
-                    output["global_features"], all_global, self.logit_scale
+                    output["global_features"], self.global_prototypes, self.logit_scale
                 )
                 local_scores, _, _, _ = query_conditioned_reconstruction(
                     output["parts"], query_patches, candidate_parts,
@@ -575,7 +602,7 @@ class ContinualVSMRFSCILTrainer:
         # Historical references remain untouched; only this Session's samples
         # receive their first and permanent component references.
         with torch.no_grad():
-            self.classes, self.global_prototypes, self.local_prototypes, final_parts = (
+            self.classes, _, self.local_prototypes, final_parts = (
                 self._prototype_bank(cls, patches, labels)
             )
             for index in range(previous_memory_size, len(self.memory)):
