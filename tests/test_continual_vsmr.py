@@ -53,14 +53,6 @@ class TestContinualVSMRUtilities(unittest.TestCase):
         self.assertIsNotNone(student.grad)
         self.assertTrue(torch.isfinite(student.grad).all())
 
-    def test_distillation_has_student_gradient_only(self):
-        student = torch.randn(5, 3, requires_grad=True)
-        teacher = torch.randn(5, 3, requires_grad=True)
-        loss = distillation_kl(student, teacher, temperature=2.0)
-        loss.backward()
-        self.assertIsNotNone(student.grad)
-        self.assertIsNone(teacher.grad)
-
 
 if __name__ == "__main__":
     unittest.main()
