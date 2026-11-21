@@ -13,7 +13,7 @@ INDEX_ROOT = os.path.abspath(os.path.expanduser(
 ))
 
 ARGS = [
-    "--method", "vsmr",
+    "--method", "continual_vsmr",
     "-project", "base",
     "-dataset", "cub200",
     "-vit",
