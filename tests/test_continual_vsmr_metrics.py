@@ -20,16 +20,16 @@ class TestContinualVSMRSessionMetrics(unittest.TestCase):
         )
         expected_macro = (0.8 + 0.5 + 0.5) / 3.0
         self.assertAlmostEqual(result["class_average_accuracy"], expected_macro, places=6)
-        self.assertAlmostEqual(result["sample_accuracy"], 12 / 14, places=6)
+        self.assertAlmostEqual(result["sample_accuracy"], 10 / 14, places=6)
         self.assertAlmostEqual(result["base_class_average_accuracy"], 0.65, places=6)
         self.assertAlmostEqual(result["current_new_class_average_accuracy"], 0.5, places=6)
         self.assertEqual(len(result["confusion_matrix"]), 3)
 
     def test_aa_is_mean_of_all_session_macro_accuracies_and_pd_is_first_minus_last(self):
         records = [
-            {"session": 0, "class_average_accuracy": 0.90, "sample_accuracy": 0.91},
-            {"session": 1, "class_average_accuracy": 0.80, "sample_accuracy": 0.82},
-            {"session": 2, "class_average_accuracy": 0.60, "sample_accuracy": 0.65},
+            {"session": 0, "seen_classes": 2, "evaluation_samples": 20, "class_average_accuracy": 0.90, "sample_accuracy": 0.91},
+            {"session": 1, "seen_classes": 3, "evaluation_samples": 30, "class_average_accuracy": 0.80, "sample_accuracy": 0.82},
+            {"session": 2, "seen_classes": 4, "evaluation_samples": 40, "class_average_accuracy": 0.60, "sample_accuracy": 0.65},
         ]
         summary = summarize_session_metrics(records)
         self.assertAlmostEqual(summary["AA"], (0.90 + 0.80 + 0.60) / 3)
