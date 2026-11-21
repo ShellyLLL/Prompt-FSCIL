@@ -59,6 +59,19 @@ class FrozenFeatureMemory:
         return [{"label": r.label, "sample_id": r.sample_id, "session": r.session}
                 for r in self.records]
 
+    def state_dict(self):
+        """Serialize the complete CPU FP16 feature replay memory for resumption."""
+        return [
+            {
+                "cls": record.cls.clone(),
+                "patches": record.patches.clone(),
+                "label": int(record.label),
+                "sample_id": str(record.sample_id),
+                "session": int(record.session),
+            }
+            for record in self.records
+        ]
+
     def __len__(self):
         return len(self.records)
 
