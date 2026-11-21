@@ -70,7 +70,7 @@ class TestContinualVSMRTrainingPipeline(unittest.TestCase):
     def test_synthetic_base_incremental_evaluation_and_complete_report(self):
         torch.manual_seed(21)
         args = SimpleNamespace(
-            base_class=2, way=2, shot=2, sessions=2,
+            base_class=2, way=1, shot=2, sessions=3,
             epochs_base=1, epochs_new=1,
             num_workers=0, test_batch_size=8,
             vsmr_classes_per_batch=2, vsmr_samples_per_class=2,
@@ -124,27 +124,40 @@ class TestContinualVSMRTrainingPipeline(unittest.TestCase):
             self.assertEqual(trainer.local_prototypes.shape, (2, 3, 8))
             trainer._evaluate(TinyImageDataset([0, 1], seed=23), 0)
 
-            support = TinyImageDataset([2, 2, 3, 3], seed=24)
-            trainer._incremental_session(support, 1)
-            self.assertEqual(len(trainer.memory), 8)
-            self.assertEqual(trainer.classes.tolist(), [0, 1, 2, 3])
-            self.assertEqual(trainer.global_prototypes.shape, (4, 8))
-            self.assertEqual(trainer.local_prototypes.shape, (4, 3, 8))
+            support_s1 = TinyImageDataset([2, 2], seed=24)
+            trainer._incremental_session(support_s1, 1)
+            self.assertEqual(len(trainer.memory), 6)
+            self.assertEqual(trainer.classes.tolist(), [0, 1, 2])
+            self.assertEqual(trainer.global_prototypes.shape, (3, 8))
+            self.assertEqual(trainer.local_prototypes.shape, (3, 3, 8))
+            historical_snapshot = {
+                key: value.clone() for key, value in trainer.previous_reference.items()
+            }
             self.assertEqual(
                 [name for name, parameter in trainer.model.named_parameters() if parameter.requires_grad],
                 ["decomposer.shared_prompts"],
             )
-            trainer._evaluate(TinyImageDataset([0, 1, 2, 3], seed=25), 1)
+            trainer._evaluate(TinyImageDataset([0, 1, 2], seed=25), 1)
+
+            support_s2 = TinyImageDataset([3, 3], seed=26)
+            trainer._incremental_session(support_s2, 2)
+            self.assertEqual(len(trainer.memory), 8)
+            self.assertEqual(trainer.classes.tolist(), [0, 1, 2, 3])
+            self.assertEqual(trainer.global_prototypes.shape, (4, 8))
+            self.assertEqual(trainer.local_prototypes.shape, (4, 3, 8))
+            for key, value in historical_snapshot.items():
+                self.assertTrue(torch.equal(trainer.previous_reference[key], value))
+            trainer._evaluate(TinyImageDataset([0, 1, 2, 3], seed=27), 2)
             summary = trainer._write_final_report(1.0)
-            self.assertEqual(summary["num_sessions"], 2)
+            self.assertEqual(summary["num_sessions"], 3)
             self.assertAlmostEqual(
                 summary["AA"],
-                sum(summary["session_class_average_accuracy"]) / 2.0,
+                sum(summary["session_class_average_accuracy"]) / 3.0,
             )
             self.assertAlmostEqual(
                 summary["PD"],
                 summary["session_class_average_accuracy"][0]
-                - summary["session_class_average_accuracy"][1],
+                - summary["session_class_average_accuracy"][2],
             )
             self.assertTrue(os.path.isfile(os.path.join(directory, "session_metrics.csv")))
             self.assertTrue(os.path.isfile(os.path.join(directory, "summary.json")))
