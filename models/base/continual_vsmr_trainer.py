@@ -35,7 +35,6 @@ from .vsmr_losses import (
     global_logits,
     leave_one_out_global,
     ot_barycenter,
-    attention_overlap_loss,
 )
 from .vsmr_resynthesis import (
     local_leave_one_out_query_logits,
@@ -337,12 +336,11 @@ class ContinualVSMRFSCILTrainer:
         )
         w_local = float(getattr(self.args, "vsmr_local_weight", 1.0))
         w_joint = float(getattr(self.args, "vsmr_joint_weight", 1.0))
-        w_overlap = float(getattr(self.args, "vsmr_overlap_weight", 0.01))
         for epoch in range(epochs):
             sampler.set_epoch(epoch)
             self.model.train()
             totals = {"loss": 0.0, "global": 0.0, "local": 0.0,
-                      "joint": 0.0, "overlap": 0.0}
+                      "joint": 0.0}
             steps = 0
             for images, batch_labels, _ in tqdm(loader, desc="Base {}/{}".format(epoch + 1, epochs)):
                 images = images.to(self.device, non_blocking=True)
@@ -353,8 +351,7 @@ class ContinualVSMRFSCILTrainer:
                 global_loss = F.cross_entropy(global_scores, targets)
                 local_loss = F.cross_entropy(local_scores, targets)
                 joint_loss = F.cross_entropy(joint_scores, targets)
-                overlap_loss = attention_overlap_loss(output["attention"])
-                loss = global_loss + w_local * local_loss + w_joint * joint_loss + w_overlap * overlap_loss
+                loss = global_loss + w_local * local_loss + w_joint * joint_loss
                 if not torch.isfinite(loss):
                     raise FloatingPointError("Non-finite Base loss.")
                 optimizer.zero_grad(set_to_none=True)
@@ -368,7 +365,6 @@ class ContinualVSMRFSCILTrainer:
                 totals["global"] += float(global_loss.detach())
                 totals["local"] += float(local_loss.detach())
                 totals["joint"] += float(joint_loss.detach())
-                totals["overlap"] += float(overlap_loss.detach())
                 steps += 1
             scheduler.step()
             record = {"stage": "base_train", "epoch": epoch + 1}
