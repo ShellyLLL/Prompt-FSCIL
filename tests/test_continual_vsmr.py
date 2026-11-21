@@ -110,8 +110,8 @@ class TestContinualVSMRTrainingPipeline(unittest.TestCase):
         trainer.classes = None
         trainer.session_records = []
         trainer.confusion_matrices = {}
-        trainer._train_transform = lambda: None
-        trainer._eval_transform = lambda: None
+        trainer._train_transform = lambda: (lambda image: image)
+        trainer._eval_transform = lambda: (lambda image: image)
         trainer._append_log = lambda record: None
 
         with tempfile.TemporaryDirectory() as directory:
