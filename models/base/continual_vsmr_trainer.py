@@ -380,17 +380,21 @@ class ContinualVSMRFSCILTrainer:
             trainset, 0, is_base=True
         )
         cls, patches, labels = self._all_memory()
-        self.classes, _, self.local_prototypes, base_parts = (
-            self._prototype_bank(cls, patches, labels)
-        )
-        # Base global prototypes use every real Base training image, while the
-        # local OT memory uses the deterministic per-class feature budget.
-        base_global_features = self._global_features(base_cls.to(self.device))
-        base_global_labels = base_labels.to(self.device)
-        self.global_prototypes = torch.stack([
-            F.normalize(base_global_features[base_global_labels == class_id].mean(0), dim=-1)
-            for class_id in range(int(self.args.base_class))
-        ]).detach()
+        # Prototype construction is a post-Base cache operation, not another
+        # optimization step. Do not retain an autograd graph in the S0 bank.
+        with torch.no_grad():
+            self.classes, _, self.local_prototypes, base_parts = (
+                self._prototype_bank(cls, patches, labels)
+            )
+            self.local_prototypes = self.local_prototypes.detach()
+            # Base global prototypes use every real Base training image, while
+            # local OT memory uses the deterministic per-class feature budget.
+            base_global_features = self._global_features(base_cls.to(self.device))
+            base_global_labels = base_labels.to(self.device)
+            self.global_prototypes = torch.stack([
+                F.normalize(base_global_features[base_global_labels == class_id].mean(0), dim=-1)
+                for class_id in range(int(self.args.base_class))
+            ]).detach()
         self.base_reference = {
             record.sample_id: part.detach().cpu().clone()
             for record, part in zip(self.memory.records, base_parts)
