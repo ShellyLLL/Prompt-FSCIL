@@ -406,6 +406,7 @@ class ContinualVSMRFSCILTrainer:
             "global_prototypes": self.global_prototypes.cpu(),
             "local_prototypes": self.local_prototypes.cpu(),
             "memory_metadata": self.memory.metadata(),
+            "feature_memory": self.memory.state_dict(),
             "base_reference": self.base_reference,
         }, os.path.join(self.save_dir, "continual_vsmr_base.pth"))
         self._append_log({
@@ -605,6 +606,12 @@ class ContinualVSMRFSCILTrainer:
             self.classes, _, self.local_prototypes, final_parts = (
                 self._prototype_bank(cls, patches, labels)
             )
+            historical_drift = prompt_consistency_loss(
+                final_parts[reference_indices],
+                reference_parts,
+                epsilon=self.epsilon,
+                iterations=self.sinkhorn_steps,
+            )
             for index in range(previous_memory_size, len(self.memory)):
                 sample_id = self.memory.records[index].sample_id
                 self.previous_reference[sample_id] = final_parts[index].cpu().clone()
@@ -617,6 +624,7 @@ class ContinualVSMRFSCILTrainer:
             "prompt_delta_from_previous": float((prompt.detach() - previous_prompt).norm()),
             "historical_reference_count": historical_count,
             "new_reference_count": len(self.memory) - previous_memory_size,
+            "historical_component_drift": float(historical_drift),
         })
 
     @torch.no_grad()
@@ -693,6 +701,7 @@ class ContinualVSMRFSCILTrainer:
             "global_prototypes": self.global_prototypes.cpu(),
             "local_prototypes": self.local_prototypes.cpu(),
             "memory_metadata": self.memory.metadata(),
+            "feature_memory": self.memory.state_dict(),
             "base_reference": self.base_reference,
             "previous_reference": self.previous_reference,
             "session_records": self.session_records,
