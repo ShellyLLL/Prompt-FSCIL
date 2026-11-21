@@ -46,6 +46,34 @@ class TestContinualVSMRSessionMetrics(unittest.TestCase):
                 {"session": 2, "class_average_accuracy": 0.7, "sample_accuracy": 0.7},
             ])
 
+
+    def test_evaluation_rejects_out_of_range_prediction_instead_of_clamping(self):
+        with self.assertRaises(RuntimeError):
+            evaluate_session_predictions(
+                torch.tensor([0, 1, 2]),
+                torch.tensor([0, 1, 3]),
+                base_class=2, seen_classes=3, session=1, way=1,
+            )
+
+    def test_evaluation_rejects_wrong_seen_class_count_for_session(self):
+        with self.assertRaises(ValueError):
+            evaluate_session_predictions(
+                torch.tensor([0, 1, 2]),
+                torch.tensor([0, 1, 2]),
+                base_class=2, seen_classes=3, session=2, way=1,
+            )
+
+    def test_session_macro_accuracy_is_not_weighted_by_class_sample_count(self):
+        labels = torch.tensor([0] * 100 + [1] * 10 + [2] * 10)
+        predictions = torch.tensor([0] * 90 + [1] * 10 + [1] * 5 + [2] * 5 + [1] * 5 + [2] * 5)
+        result = evaluate_session_predictions(
+            labels, predictions, base_class=2, seen_classes=3,
+            session=1, way=1,
+        )
+        expected = (0.9 + 0.5 + 0.5) / 3.0
+        self.assertAlmostEqual(result["class_average_accuracy"], expected, places=6)
+        self.assertNotAlmostEqual(result["class_average_accuracy"], result["sample_accuracy"], places=3)
+
     def test_evaluation_rejects_missing_seen_class(self):
         with self.assertRaises(RuntimeError):
             evaluate_session_predictions(
