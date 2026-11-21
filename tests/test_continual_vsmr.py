@@ -76,9 +76,11 @@ class TestContinualVSMRArchitecture(unittest.TestCase):
         model.assert_incremental_parameter_contract()
         prompt = model.decomposer.shared_prompts
         before = prompt.detach().clone()
-        loss = model.decompose_features(
+        parts = model.decompose_features(
             output["cls_features"].detach(), output["patch_features"].detach()
-        )["parts"].square().mean()
+        )["parts"]
+        probe = torch.randn_like(parts)
+        loss = (parts * probe).sum()
         loss.backward()
         self.assertIsNotNone(prompt.grad)
         self.assertTrue(torch.isfinite(prompt.grad).all())
