@@ -1,8 +1,6 @@
 """Core utilities for Continual VSMR feature replay and OT prototypes."""
 from dataclasses import dataclass
 import torch
-import torch.nn.functional as F
-
 from .vsmr_losses import ot_barycenter, ot_distance
 from .vsmr_resynthesis import query_conditioned_reconstruction
 
@@ -29,8 +27,16 @@ class FrozenFeatureMemory:
         if cls_features.ndim != 2 or patches.ndim != 3 or labels.ndim != 1:
             raise ValueError("Expected CLS [B,D], Patch [B,N,D], labels [B].")
         n = labels.numel()
+        if n < 1:
+            raise ValueError("Cannot append an empty feature batch.")
         if cls_features.shape[0] != n or patches.shape[0] != n or len(sample_ids) != n:
             raise ValueError("Feature, label and sample-id counts differ.")
+        if cls_features.shape[1] != patches.shape[2]:
+            raise ValueError("CLS and Patch embedding dimensions must match.")
+        if not torch.isfinite(cls_features).all() or not torch.isfinite(patches).all():
+            raise ValueError("Feature memory cannot store non-finite features.")
+        if any(int(label) < 0 for label in labels.detach().cpu().tolist()):
+            raise ValueError("Feature memory labels must be non-negative.")
         existing = {}
         for record in self.records:
             existing[record.label] = existing.get(record.label, 0) + 1
@@ -95,6 +101,21 @@ def class_ot_prototypes(parts, labels, epsilon=0.05, iterations=30,
 def loo_class_prototypes(parts, labels, query_indices, classes,
                          epsilon=0.05, iterations=30, barycenter_iterations=5):
     """Return [B,C,M,D], excluding each query from its own class prototype."""
+    if parts.ndim != 3 or labels.ndim != 1 or parts.shape[0] != labels.numel():
+        raise ValueError("Expected parts [N,M,D] and labels [N].")
+    query_indices = torch.as_tensor(
+        query_indices, dtype=torch.long, device=labels.device
+    ).reshape(-1)
+    classes = torch.as_tensor(classes, dtype=torch.long, device=labels.device).reshape(-1)
+    if query_indices.numel() == 0:
+        raise ValueError("At least one query index is required.")
+    if torch.any(query_indices < 0) or torch.any(query_indices >= labels.numel()):
+        raise IndexError("LOO query index is outside feature memory.")
+    if torch.unique(query_indices).numel() != query_indices.numel():
+        raise ValueError("LOO query indices must be unique within a batch.")
+    observed = torch.unique(labels, sorted=True)
+    if not torch.equal(classes, observed):
+        raise ValueError("LOO classes must exactly match the labels in feature memory.")
     full = {}
     for cls in classes.tolist():
         values = parts[labels == int(cls)]
@@ -129,15 +150,6 @@ def prompt_consistency_loss(student_parts, teacher_parts, mask=None,
         ot_distance(student_parts[i:i+1], teacher_parts[i:i+1], epsilon, iterations).mean()
         for i in range(student_parts.shape[0])
     ]).mean()
-
-
-def distillation_kl(student_logits, teacher_logits, temperature=2.0):
-    if student_logits.shape != teacher_logits.shape:
-        raise ValueError("Teacher/student logits must align.")
-    t = float(temperature)
-    return F.kl_div(F.log_softmax(student_logits / t, dim=-1),
-                    F.softmax(teacher_logits.detach() / t, dim=-1),
-                    reduction="batchmean") * (t * t)
 
 
 def build_query_logits(query_parts, query_patches, candidate_parts,
