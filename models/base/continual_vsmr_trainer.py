@@ -543,7 +543,14 @@ class ContinualVSMRFSCILTrainer:
 
         for epoch in range(epochs):
             self.model.train()
-            totals = {"total": 0.0, "local": 0.0, "joint": 0.0, "history": 0.0}
+            totals = {
+                "total": 0.0, "local": 0.0, "joint": 0.0, "history": 0.0,
+                "classification_prompt_grad_norm": 0.0,
+                "history_prompt_grad_norm_unweighted": 0.0,
+                "history_prompt_grad_norm_weighted": 0.0,
+                "weighted_history_to_classification_grad_ratio": 0.0,
+                "history_classification_grad_cosine": 0.0,
+            }
             steps = 0
             for indices in self._balanced_memory_indices(
                 labels, classes_per_batch, samples_per_class,
@@ -609,6 +616,8 @@ class ContinualVSMRFSCILTrainer:
                 totals["local"] += float(local_loss.detach())
                 totals["joint"] += float(joint_loss.detach())
                 totals["history"] += float(history_loss.detach())
+                for key, value in gradient_diagnostics.items():
+                    totals[key] += float(value)
                 steps += 1
 
             record = {"stage": "incremental_train", "session": session, "epoch": epoch + 1}
