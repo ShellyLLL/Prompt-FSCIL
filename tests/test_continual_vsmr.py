@@ -137,7 +137,12 @@ class TestContinualVSMRTrainingPipeline(unittest.TestCase):
                 [name for name, parameter in trainer.model.named_parameters() if parameter.requires_grad],
                 ["decomposer.shared_prompts"],
             )
-            trainer._evaluate(TinyImageDataset([0, 1, 2], seed=25), 1)
+            session_one_metrics = trainer._evaluate(TinyImageDataset([0, 1, 2], seed=25), 1)
+            self.assertEqual(
+                set(session_one_metrics["inference_ablations"]),
+                {"joint_ot_query", "global_only", "local_ot_query",
+                 "ot_without_query_reconstruction", "fixed_index_query"},
+            )
 
             support_s2 = TinyImageDataset([3, 3], seed=26)
             trainer._incremental_session(support_s2, 2)
