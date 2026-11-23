@@ -35,6 +35,19 @@ class TestVSMRDiagnostics(unittest.TestCase):
         self.assertGreaterEqual(result["patch_coverage_top10_union_mean"], 0.0)
         self.assertLessEqual(result["patch_coverage_top10_union_mean"], 1.0)
 
+    def test_stratified_sampling_keeps_within_and_between_class_pairs(self):
+        torch.manual_seed(103)
+        parts = F.normalize(torch.randn(200, 3, 8), dim=-1)
+        attention = torch.softmax(torch.randn(200, 3, 16), dim=-1)
+        labels = torch.arange(100).repeat_interleave(2)
+        result = component_set_diagnostics(
+            parts, attention, labels, epsilon=0.1, iterations=10,
+            max_samples=48, max_pairs=128,
+        )
+        self.assertEqual(result["diagnostic_samples"], 48)
+        self.assertIsNotNone(result["within_class_component_ot_distance_mean"])
+        self.assertIsNotNone(result["between_class_component_ot_distance_mean"])
+
     def test_prompt_gradient_diagnostics_match_weighted_gradient_ratio(self):
         torch.manual_seed(102)
         prompt = torch.nn.Parameter(torch.randn(4, 8))
