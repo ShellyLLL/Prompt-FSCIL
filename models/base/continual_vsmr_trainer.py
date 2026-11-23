@@ -35,10 +35,16 @@ from .vsmr_losses import (
     global_logits,
     leave_one_out_global,
     ot_barycenter,
+    local_logits,
 )
 from .vsmr_resynthesis import (
     local_leave_one_out_query_logits,
     query_conditioned_reconstruction,
+    query_conditioned_fixed_index_reconstruction,
+)
+from .vsmr_diagnostics import (
+    component_set_diagnostics,
+    prompt_gradient_diagnostics,
 )
 
 
@@ -268,6 +274,19 @@ class ContinualVSMRFSCILTrainer:
         )
         return global_features, parts
 
+    @torch.no_grad()
+    def _log_component_diagnostics(self, stage, cls_features, patch_features, labels):
+        """Log training-memory component statistics without changing optimization."""
+        self.model.eval()
+        _, parts, attention = self.model.decomposer(cls_features, patch_features)
+        record = component_set_diagnostics(
+            parts, attention, labels, epsilon=self.epsilon,
+            iterations=self.sinkhorn_steps,
+        )
+        record.update({"stage": "component_diagnostics", "session": int(stage)})
+        self._append_log(record)
+        return record
+
     def _prototype_bank(self, cls_features, patch_features, labels):
         global_features, parts = self._current_parts(cls_features, patch_features)
         classes = torch.unique(labels, sorted=True)
@@ -395,6 +414,7 @@ class ContinualVSMRFSCILTrainer:
                 F.normalize(base_global_features[base_global_labels == class_id].mean(0), dim=-1)
                 for class_id in range(int(self.args.base_class))
             ]).detach()
+        self._log_component_diagnostics(0, cls, patches, labels)
         self.base_reference = {
             record.sample_id: part.detach().cpu().clone()
             for record, part in zip(self.memory.records, base_parts)
@@ -569,11 +589,11 @@ class ContinualVSMRFSCILTrainer:
                     epsilon=self.epsilon,
                     iterations=self.sinkhorn_steps,
                 )
-                loss = (
-                    w_local * local_loss
-                    + w_joint * joint_loss
-                    + w_history * history_loss
+                classification_objective = w_local * local_loss + w_joint * joint_loss
+                gradient_diagnostics = prompt_gradient_diagnostics(
+                    classification_objective, history_loss, prompt, w_history
                 )
+                loss = classification_objective + w_history * history_loss
                 if not torch.isfinite(loss):
                     raise FloatingPointError("Non-finite incremental loss.")
                 optimizer.zero_grad(set_to_none=True)
@@ -596,6 +616,7 @@ class ContinualVSMRFSCILTrainer:
             record["prompt_delta_from_previous"] = float(
                 (prompt.detach() - previous_prompt).norm()
             )
+            record.update(gradient_diagnostics)
             self._append_log(record)
 
         # Recompute every seen-class prototype in the current Prompt space.
@@ -615,6 +636,7 @@ class ContinualVSMRFSCILTrainer:
                 sample_id = self.memory.records[index].sample_id
                 self.previous_reference[sample_id] = final_parts[index].cpu().clone()
 
+        self._log_component_diagnostics(session, cls, patches, labels)
         self._append_log({
             "stage": "memory_update",
             "session": session,
