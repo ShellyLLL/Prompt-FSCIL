@@ -31,7 +31,9 @@ def get_command_line_parser():
     parser.add_argument('--continual_classes_per_batch', type=int, default=16)
     parser.add_argument('--continual_samples_per_class', type=int, default=4)
     parser.add_argument('--vsmr_prompt_temperature', type=float, default=1.0)
-    parser.add_argument('--vsmr_gate_hidden_dim', type=int, default=384)
+    # Continual VSMR-Prompt diagnostic sampling (training-memory only).
+    parser.add_argument('--vsmr_diagnostics_max_samples', type=int, default=48)
+    parser.add_argument('--vsmr_diagnostics_max_pairs', type=int, default=512)
     parser.add_argument('--vsmr_classes_per_batch', type=int, default=16)
     parser.add_argument('--vsmr_samples_per_class', type=int, default=4)
     parser.add_argument('--vsmr_lr', type=float, default=2e-4)
@@ -41,6 +43,7 @@ def get_command_line_parser():
     parser.add_argument('--vsmr_barycenter_iterations', type=int, default=5)
     parser.add_argument('--vsmr_local_weight', type=float, default=1.0)
     parser.add_argument('--vsmr_joint_weight', type=float, default=1.0)
+    # Legacy VSMR trainer options; retained for --method vsmr compatibility.
     parser.add_argument('--vsmr_episode_novel_fraction', type=float, default=0.25)
     parser.add_argument('--vsmr_episode_max_shot', type=int, default=3)
     parser.add_argument('--vsmr_alignment_weight', type=float, default=0.2)
