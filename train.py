@@ -44,6 +44,7 @@ def get_command_line_parser():
     parser.add_argument('--vsmr_local_weight', type=float, default=1.0)
     parser.add_argument('--vsmr_joint_weight', type=float, default=1.0)
     # Legacy VSMR trainer options; retained for --method vsmr compatibility.
+    parser.add_argument('--vsmr_gate_hidden_dim', type=int, default=384)
     parser.add_argument('--vsmr_episode_novel_fraction', type=float, default=0.25)
     parser.add_argument('--vsmr_episode_max_shot', type=int, default=3)
     parser.add_argument('--vsmr_alignment_weight', type=float, default=0.2)
