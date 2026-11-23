@@ -41,7 +41,15 @@ def component_set_diagnostics(parts, attention, labels, epsilon=0.05,
         # Stratify by class so class-conditional distances are not biased by
         # the class-sorted ordering of the feature memory.
         classes = torch.unique(labels, sorted=True)
-        quota = max(1, int(max_samples) // int(classes.numel()))
+        # Retain at least two examples per sampled class so within-class
+        # distances remain measurable even when the memory has 100+ classes.
+        max_classes = max(1, int(max_samples) // 2)
+        if classes.numel() > max_classes:
+            class_positions = torch.linspace(
+                0, classes.numel() - 1, steps=max_classes, device=parts.device
+            ).round().long().unique()
+            classes = classes[class_positions]
+        quota = max(2, int(max_samples) // int(classes.numel()))
         selected = []
         for class_id in classes:
             candidates = torch.nonzero(labels == class_id, as_tuple=False).flatten()
