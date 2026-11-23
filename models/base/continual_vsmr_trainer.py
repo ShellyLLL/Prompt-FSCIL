@@ -655,7 +655,11 @@ class ContinualVSMRFSCILTrainer:
             raise RuntimeError("Test dataset must expose transform.")
         testset.transform = self._eval_transform()
         loader = self._loader(testset, int(self.args.test_batch_size))
-        predictions, labels_all = [], []
+        prediction_sets = {
+            "joint_ot_query": [], "global_only": [], "local_ot_query": [],
+            "ot_without_query_reconstruction": [], "fixed_index_query": [],
+        }
+        labels_all = []
         self.model.eval()
         try:
             for images, labels, _ in tqdm(loader, desc="Evaluate S{}".format(session)):
@@ -668,18 +672,51 @@ class ContinualVSMRFSCILTrainer:
                     self.model.reconstructor, self.epsilon, self.sinkhorn_steps,
                     self.logit_scale,
                 )
-                logits = self.model.fusion(global_scores, local_scores)
-                predictions.append(logits.argmax(dim=1).cpu())
+                fixed_scores, _, _ = query_conditioned_fixed_index_reconstruction(
+                    output["parts"], output["patch_features"], self.local_prototypes,
+                    self.model.reconstructor, scale=self.logit_scale,
+                )
+                no_query_scores = local_logits(
+                    output["parts"], self.local_prototypes,
+                    epsilon=self.epsilon, iterations=self.sinkhorn_steps,
+                    scale=self.logit_scale,
+                )
+                joint_scores = self.model.fusion(global_scores, local_scores)
+                score_sets = {
+                    "joint_ot_query": joint_scores,
+                    "global_only": global_scores,
+                    "local_ot_query": local_scores,
+                    "ot_without_query_reconstruction": no_query_scores,
+                    "fixed_index_query": self.model.fusion(global_scores, fixed_scores),
+                }
+                for key, scores in score_sets.items():
+                    prediction_sets[key].append(scores.argmax(dim=1).cpu())
                 labels_all.append(torch.as_tensor(labels, dtype=torch.long).cpu())
         finally:
             testset.transform = original
-        predictions = torch.cat(predictions)
         labels = torch.cat(labels_all)
+        predictions = torch.cat(prediction_sets["joint_ot_query"])
         metrics = evaluate_session_predictions(
             labels, predictions, int(self.args.base_class),
             int(self.args.base_class + session * int(self.args.way) if session else self.args.base_class),
             session, int(self.args.way),
         )
+        ablation_metrics = {}
+        for key, batch_predictions in prediction_sets.items():
+            branch_predictions = torch.cat(batch_predictions)
+            branch_result = evaluate_session_predictions(
+                labels, branch_predictions, int(self.args.base_class),
+                int(self.args.base_class + session * int(self.args.way) if session else self.args.base_class),
+                session, int(self.args.way),
+            )
+            ablation_metrics[key] = {
+                "class_average_accuracy": branch_result["class_average_accuracy"],
+                "sample_accuracy": branch_result["sample_accuracy"],
+                "base_class_average_accuracy": branch_result["base_class_average_accuracy"],
+                "old_novel_class_average_accuracy": branch_result["old_novel_class_average_accuracy"],
+                "current_new_class_average_accuracy": branch_result["current_new_class_average_accuracy"],
+            }
+        metrics["inference_ablations"] = ablation_metrics
         metrics["stage"] = "evaluation"
         metrics["method"] = "ContinualVSMR-Prompt"
         self.confusion_matrices[session] = metrics.pop("confusion_matrix")
