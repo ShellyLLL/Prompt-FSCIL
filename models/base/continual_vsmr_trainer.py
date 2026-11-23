@@ -138,7 +138,30 @@ class ContinualVSMRFSCILTrainer:
         )
         os.makedirs(self.save_dir, exist_ok=True)
         self.metrics_path = os.path.join(self.save_dir, "metrics.jsonl")
-        self._write_json(os.path.join(self.save_dir, "config.json"), vars(self.args))
+        # Persist only settings that define this method. train.py is shared by
+        # legacy baselines, so their unrelated defaults must not pollute the
+        # reproducibility record for Continual VSMR-Prompt.
+        active_config_keys = {
+            "method", "project", "dataset", "dataroot", "index_list_root",
+            "base_class", "way", "shot", "sessions", "seed", "gpu",
+            "epochs_base", "epochs_new", "num_workers", "test_batch_size",
+            "out", "vit", "vsmr_num_parts", "vsmr_prompt_temperature",
+            "vsmr_global_weight", "vsmr_local_weight_eval",
+            "vsmr_classes_per_batch", "vsmr_samples_per_class",
+            "vsmr_lr", "vsmr_weight_decay", "vsmr_ot_epsilon",
+            "vsmr_sinkhorn_iterations", "vsmr_barycenter_iterations",
+            "vsmr_local_weight", "vsmr_joint_weight", "vsmr_logit_scale",
+            "vsmr_diagnostics_max_samples", "vsmr_diagnostics_max_pairs",
+            "continual_base_memory_per_class", "continual_prompt_lr",
+            "continual_prompt_weight_decay", "continual_local_weight",
+            "continual_joint_weight", "continual_history_consistency_weight",
+            "continual_classes_per_batch", "continual_samples_per_class",
+        }
+        active_config = {
+            key: value for key, value in vars(self.args).items()
+            if key in active_config_keys
+        }
+        self._write_json(os.path.join(self.save_dir, "config.json"), active_config)
         print("[ContinualVSMR] output={}".format(self.save_dir))
 
     @staticmethod
