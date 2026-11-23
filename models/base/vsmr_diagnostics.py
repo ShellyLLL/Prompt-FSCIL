@@ -33,13 +33,27 @@ def component_set_diagnostics(parts, attention, labels, epsilon=0.05,
     if not torch.isfinite(parts).all() or not torch.isfinite(attention).all():
         raise ValueError("Diagnostic inputs contain non-finite values.")
 
+    if int(max_samples) < 2 or int(max_pairs) < 1:
+        raise ValueError("Diagnostic sample and pair limits must be positive.")
+    labels = labels.to(device=parts.device, dtype=torch.long)
     n = parts.shape[0]
     if n > int(max_samples):
-        indices = torch.linspace(
-            0, n - 1, steps=int(max_samples), device=parts.device
-        ).round().long().unique()
+        # Stratify by class so class-conditional distances are not biased by
+        # the class-sorted ordering of the feature memory.
+        classes = torch.unique(labels, sorted=True)
+        quota = max(1, int(max_samples) // int(classes.numel()))
+        selected = []
+        for class_id in classes:
+            candidates = torch.nonzero(labels == class_id, as_tuple=False).flatten()
+            take = min(quota, int(candidates.numel()))
+            positions = torch.linspace(
+                0, candidates.numel() - 1, steps=take, device=parts.device
+            ).round().long()
+            selected.extend(candidates[positions].tolist())
+        if len(selected) > int(max_samples):
+            selected = selected[:int(max_samples)]
+        indices = torch.tensor(selected, dtype=torch.long, device=parts.device)
         parts, attention, labels = parts[indices], attention[indices], labels[indices]
-    labels = labels.to(device=parts.device, dtype=torch.long)
     parts = F.normalize(parts, dim=-1)
     attention = attention.clamp_min(0.0)
     attention = attention / attention.sum(dim=-1, keepdim=True).clamp_min(1e-12)
@@ -69,21 +83,22 @@ def component_set_diagnostics(parts, attention, labels, epsilon=0.05,
     patch_coverage = covered.float().mean()
 
     same_distances, different_distances = [], []
-    pair_count = 0
     sample_count = parts.shape[0]
-    for left in range(sample_count):
-        for right in range(left + 1, sample_count):
-            distance = ot_distance(
-                parts[left:left + 1], parts[right:right + 1],
-                epsilon=epsilon, iterations=iterations,
-            )[0]
-            target = same_distances if labels[left] == labels[right] else different_distances
-            target.append(distance)
-            pair_count += 1
-            if pair_count >= int(max_pairs):
-                break
-        if pair_count >= int(max_pairs):
-            break
+    pair_indices = [(left, right) for left in range(sample_count)
+                    for right in range(left + 1, sample_count)]
+    if len(pair_indices) > int(max_pairs):
+        positions = torch.linspace(
+            0, len(pair_indices) - 1, steps=int(max_pairs), device=parts.device
+        ).round().long().unique().tolist()
+        pair_indices = [pair_indices[index] for index in positions]
+    for left, right in pair_indices:
+        distance = ot_distance(
+            parts[left:left + 1], parts[right:right + 1],
+            epsilon=epsilon, iterations=iterations,
+        )[0]
+        target = same_distances if labels[left] == labels[right] else different_distances
+        target.append(distance)
+    pair_count = len(pair_indices)
 
     same_mean = (
         float(torch.stack(same_distances).mean().item())
