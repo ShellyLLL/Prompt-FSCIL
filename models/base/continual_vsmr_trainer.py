@@ -1,8 +1,8 @@
-"""End-to-end Continual VSMR-Prompt FSCIL trainer.
+"""End-to-end efficient Continual VSMR-Prompt FSCIL trainer.
 
-Base learns the full visual decomposition/reconstruction model on real base
-images. Each incremental session updates only the fixed shared Prompt using
-real K-shot support features and replayed frozen CLS/Patch feature memory.
+The frozen ViT is run once per training image. Base CLS/Patch features are
+cached on CPU; incremental memory stores FP16 CLS and projected Patch K/V.
+Incremental optimization updates only one shared Prompt and never reruns ViT.
 """
 import json
 import os
@@ -19,9 +19,9 @@ from tqdm import tqdm
 from dataloader.data_utils import get_base_dataloader, get_new_dataloader, set_up_datasets
 from .continual_vsmr import (
     FrozenFeatureMemory,
-    loo_class_prototypes,
-    prompt_consistency_loss,
-    decompose_cached,
+    normalized_class_means,
+    leave_one_out_cosine_logits,
+    cosine_consistency_loss,
 )
 from .continual_vsmr_model import ContinualVSMRViT
 from .continual_vsmr_metrics import (
@@ -30,21 +30,6 @@ from .continual_vsmr_metrics import (
     write_session_csv,
     write_confusion_csv,
     format_session_table,
-)
-from .vsmr_losses import (
-    global_logits,
-    leave_one_out_global,
-    ot_barycenter,
-    local_logits,
-)
-from .vsmr_resynthesis import (
-    local_leave_one_out_query_logits,
-    query_conditioned_reconstruction,
-    query_conditioned_fixed_index_reconstruction,
-)
-from .vsmr_diagnostics import (
-    component_set_diagnostics,
-    prompt_gradient_diagnostics,
 )
 
 
@@ -67,6 +52,8 @@ class IndexedDataset(Dataset):
 
 
 class BalancedBatchSampler(Sampler):
+    """Deterministic class-balanced batches without replacement within a batch."""
+
     def __init__(self, labels, classes_per_batch, samples_per_class, seed):
         self.labels = np.asarray(labels, dtype=np.int64)
         self.classes_per_batch = int(classes_per_batch)
@@ -78,11 +65,11 @@ class BalancedBatchSampler(Sampler):
             for cls in np.unique(self.labels)
         }
         if self.classes_per_batch < 2 or self.samples_per_class < 2:
-            raise ValueError("Balanced batches require >=2 classes and samples/class.")
+            raise ValueError("Balanced LOO batches require >=2 classes and samples/class.")
         if len(self.mapping) < self.classes_per_batch:
             raise ValueError("Not enough classes for a balanced batch.")
-        if any(len(indices) < self.samples_per_class for indices in self.mapping.values()):
-            raise ValueError("A base class has too few images for a balanced batch.")
+        if any(len(v) < self.samples_per_class for v in self.mapping.values()):
+            raise ValueError("A class has too few samples for a balanced batch.")
         self.num_batches = max(
             1, int(np.ceil(len(self.labels) /
                            (self.classes_per_batch * self.samples_per_class)))
@@ -98,9 +85,9 @@ class BalancedBatchSampler(Sampler):
         rng = np.random.default_rng(self.seed + self.epoch)
         classes = np.asarray(sorted(self.mapping))
         for _ in range(self.num_batches):
-            selected = rng.choice(classes, self.classes_per_batch, replace=False)
+            chosen = rng.choice(classes, self.classes_per_batch, replace=False)
             batch = []
-            for cls in selected:
+            for cls in chosen:
                 batch.extend(rng.choice(
                     self.mapping[int(cls)], self.samples_per_class, replace=False
                 ).tolist())
@@ -116,52 +103,45 @@ class ContinualVSMRFSCILTrainer:
         self.seed = max(0, int(getattr(args, "seed", 1)))
         self._seed_everything(self.seed)
         self.model = ContinualVSMRViT(self.args).to(self.device)
-        self.epsilon = float(getattr(args, "vsmr_ot_epsilon", 0.05))
-        self.sinkhorn_steps = int(getattr(args, "vsmr_sinkhorn_iterations", 30))
-        self.barycenter_steps = int(getattr(args, "vsmr_barycenter_iterations", 5))
         self.logit_scale = float(getattr(args, "vsmr_logit_scale", 16.0))
-        self.memory_per_base_class = int(getattr(args, "continual_base_memory_per_class", 5))
-        self.memory = FrozenFeatureMemory(self.memory_per_base_class)
-        self.base_reference = {}
-        self.previous_reference = {}
+        self.memory_per_class = int(getattr(args, "continual_base_memory_per_class", 5))
+        if self.memory_per_class != 5:
+            raise ValueError("VSMR V2.0 uses a fixed memory budget of exactly 5 samples/class.")
+        self.memory = FrozenFeatureMemory(self.memory_per_class)
+        self.sample_birth = {}
+        self.prototype_birth = {}
         self.global_prototypes = None
         self.local_prototypes = None
         self.classes = None
         self.session_records = []
         self.confusion_matrices = {}
+        self.timings = {}
         root = getattr(args, "out", None) or "ContinualVSMR"
         repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         root = root if os.path.isabs(root) else os.path.join(repo_root, "checkpoint", root)
         self.save_dir = os.path.join(
-            root, self.args.dataset, "ContinualVSMR",
+            root, self.args.dataset, "ContinualVSMR_V2",
             "{}_seed{}".format(time.strftime("%Y%m%d_%H%M%S"), self.seed)
         )
         os.makedirs(self.save_dir, exist_ok=True)
         self.metrics_path = os.path.join(self.save_dir, "metrics.jsonl")
-        # Persist only settings that define this method. train.py is shared by
-        # legacy baselines, so their unrelated defaults must not pollute the
-        # reproducibility record for Continual VSMR-Prompt.
-        active_config_keys = {
+        active_keys = {
             "method", "project", "dataset", "dataroot", "index_list_root",
             "base_class", "way", "shot", "sessions", "seed", "gpu",
             "epochs_base", "epochs_new", "num_workers", "test_batch_size",
-            "out", "vit", "vsmr_num_parts", "vsmr_prompt_temperature",
-            "vsmr_global_weight", "vsmr_local_weight_eval",
-            "vsmr_classes_per_batch", "vsmr_samples_per_class",
-            "vsmr_lr", "vsmr_weight_decay", "vsmr_ot_epsilon",
-            "vsmr_sinkhorn_iterations", "vsmr_barycenter_iterations",
-            "vsmr_local_weight", "vsmr_joint_weight", "vsmr_logit_scale",
-            "vsmr_diagnostics_max_samples", "vsmr_diagnostics_max_pairs",
+            "out", "vit", "vsmr_prompt_temperature", "vsmr_logit_scale",
             "continual_base_memory_per_class", "continual_prompt_lr",
-            "continual_prompt_weight_decay", "continual_local_weight",
-            "continual_joint_weight", "continual_history_consistency_weight",
-            "continual_classes_per_batch", "continual_samples_per_class",
+            "continual_prompt_weight_decay", "continual_history_rep_weight",
+            "continual_history_proto_weight", "continual_global_init",
+            "continual_global_loss_weight", "continual_local_loss_weight",
+            "continual_joint_loss_weight", "continual_classes_per_batch",
+            "continual_samples_per_class", "continual_feature_batch_size",
+            "continual_eval_batch_size",
         }
-        active_config = {
-            key: value for key, value in vars(self.args).items()
-            if key in active_config_keys
-        }
-        self._write_json(os.path.join(self.save_dir, "config.json"), active_config)
+        self._write_json(
+            os.path.join(self.save_dir, "config.json"),
+            {k: v for k, v in vars(self.args).items() if k in active_keys},
+        )
         print("[ContinualVSMR] output={}".format(self.save_dir))
 
     @staticmethod
@@ -206,170 +186,83 @@ class ContinualVSMRFSCILTrainer:
             transforms.Normalize(backbone.input_mean, backbone.input_std),
         ])
 
-    def _train_transform(self):
-        backbone = self.model.backbone
-        return transforms.Compose([
-            transforms.RandomResizedCrop(224, interpolation=self._interpolation()),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize(backbone.input_mean, backbone.input_std),
-        ])
-
-    def _loader(self, dataset, batch_size, batch_sampler=None):
+    def _loader(self, dataset, batch_size):
         workers = int(getattr(self.args, "num_workers", 4))
-        common = {
-            "num_workers": workers,
-            "pin_memory": self.device.type == "cuda",
-            "persistent_workers": workers > 0,
-        }
-        wrapped = IndexedDataset(dataset)
-        if batch_sampler is not None:
-            return DataLoader(wrapped, batch_sampler=batch_sampler, **common)
-        return DataLoader(wrapped, batch_size=int(batch_size), shuffle=False, **common)
+        return DataLoader(
+            IndexedDataset(dataset), batch_size=int(batch_size), shuffle=False,
+            num_workers=workers, pin_memory=self.device.type == "cuda",
+            persistent_workers=workers > 0,
+        )
 
     @torch.no_grad()
-    def _extract_dataset(self, dataset, batch_size=None):
+    def _extract_dataset(self, dataset, batch_size=None, store_projected=True):
         original = getattr(dataset, "transform", None)
         if original is None:
             raise RuntimeError("Dataset must expose a transform.")
         dataset.transform = self._eval_transform()
-        loader = self._loader(dataset, batch_size or int(self.args.test_batch_size))
-        cls_all, patches_all, labels_all, ids_all = [], [], [], []
+        loader = self._loader(
+            dataset, batch_size or int(getattr(self.args, "continual_feature_batch_size", 128))
+        )
+        cls_all, patch_all, key_all, value_all = [], [], [], []
+        labels_all, ids_all = [], []
         self.model.eval()
+        started = time.time()
         try:
-            for images, labels, indices in tqdm(loader, desc="Frozen feature extraction"):
-                cls, patches = self.model.backbone(images.to(self.device, non_blocking=True))
-                cls_all.append(cls.cpu())
-                patches_all.append(patches.cpu())
+            for images, labels, indices in tqdm(loader, desc="Frozen ViT feature extraction"):
+                images = images.to(self.device, non_blocking=True)
+                cls, patches = self.model.backbone(images)
+                cls_all.append(cls.cpu().half())
                 labels_all.append(torch.as_tensor(labels, dtype=torch.long).cpu())
-                ids_all.extend([int(i) for i in indices.tolist()])
+                ids_all.extend(int(i) for i in indices.tolist())
+                if store_projected:
+                    keys, values = self.model.context.project_patches(patches)
+                    key_all.append(keys.cpu().half())
+                    value_all.append(values.cpu().half())
+                else:
+                    patch_all.append(patches.cpu().half())
         finally:
             dataset.transform = original
         if not labels_all:
             raise RuntimeError("Cannot extract features from an empty dataset.")
-        return (
-            torch.cat(cls_all), torch.cat(patches_all),
-            torch.cat(labels_all), ids_all,
+        self.timings["feature_extraction_seconds"] = (
+            self.timings.get("feature_extraction_seconds", 0.0) + time.time() - started
         )
-
-    def _append_dataset_to_memory(self, dataset, session, is_base=False):
-        cls, patches, labels, indices = self._extract_dataset(dataset)
-        full_cls, full_patches, full_labels = cls, patches, labels
-        if is_base:
-            # Deterministic, reproducible class-balanced exemplars; never use test data.
-            selected = []
-            labels_np = labels.numpy()
-            rng = np.random.default_rng(self.seed)
-            for class_id in range(int(self.args.base_class)):
-                candidates = np.flatnonzero(labels_np == class_id)
-                if candidates.size < self.memory_per_base_class:
-                    raise RuntimeError(
-                        "Base class {} has {} training images; {} are required.".format(
-                            class_id, candidates.size, self.memory_per_base_class
-                        )
-                    )
-                chosen = np.sort(rng.choice(
-                    candidates, self.memory_per_base_class, replace=False
-                ))
-                selected.extend(chosen.tolist())
-            selected = torch.tensor(sorted(selected), dtype=torch.long)
-            cls, patches, labels = cls[selected], patches[selected], labels[selected]
-            indices = [indices[int(i)] for i in selected.tolist()]
-        self.memory.append(
-            cls, patches, labels,
-            ["session{}:index{}".format(session, i) for i in indices],
-            session, is_base=is_base,
-        )
-        if is_base:
-            return full_cls, full_patches, full_labels
-        return cls, patches, labels
+        result = {
+            "cls": torch.cat(cls_all),
+            "labels": torch.cat(labels_all),
+            "ids": ids_all,
+        }
+        if store_projected:
+            result["keys"], result["values"] = torch.cat(key_all), torch.cat(value_all)
+        else:
+            result["patches"] = torch.cat(patch_all)
+        return result
 
     def _all_memory(self):
-        cls, patches, labels = self.memory.tensors(self.device)
-        return cls, patches, labels
+        return self.memory.tensors(self.device)
 
-    def _global_features(self, cls_features):
-        return F.normalize(self.model.decomposer.global_projection(cls_features), dim=-1)
-
-    def _current_parts(self, cls_features, patches):
-        global_features, parts, _ = decompose_cached(
-            self.model, cls_features, patches
-        )
-        return global_features, parts
-
-    @torch.no_grad()
-    def _log_component_diagnostics(self, stage, cls_features, patch_features, labels):
-        """Log training-memory component statistics without changing optimization."""
-        self.model.eval()
-        _, parts, attention = self.model.decomposer(cls_features, patch_features)
-        record = component_set_diagnostics(
-            parts, attention, labels, epsilon=self.epsilon,
-            iterations=self.sinkhorn_steps,
-            max_samples=int(getattr(self.args, "vsmr_diagnostics_max_samples", 48)),
-            max_pairs=int(getattr(self.args, "vsmr_diagnostics_max_pairs", 512)),
-        )
-        record.update({"stage": "component_diagnostics", "session": int(stage)})
-        self._append_log(record)
-        return record
-
-    def _prototype_bank(self, cls_features, patch_features, labels):
-        global_features, parts = self._current_parts(cls_features, patch_features)
-        classes = torch.unique(labels, sorted=True)
-        global_prototypes, local_prototypes = [], []
-        for class_id in classes.tolist():
-            mask = labels == int(class_id)
-            if int(mask.sum()) < 2:
-                raise RuntimeError(
-                    "Class {} has fewer than two memory exemplars for LOO.".format(class_id)
-                )
-            global_prototypes.append(F.normalize(global_features[mask].mean(0), dim=-1))
-            local_prototypes.append(ot_barycenter(
-                parts[mask], self.epsilon, self.sinkhorn_steps, self.barycenter_steps
-            ))
-        return classes, torch.stack(global_prototypes), torch.stack(local_prototypes), parts
-
-    def _batch_logits(self, cls_features, patch_features, labels):
-        output = self.model.decompose_features(cls_features, patch_features)
-        global_features, parts = output["global_features"], output["parts"]
-        loo_global, inverse, classes = leave_one_out_global(global_features, labels)
-        class_means = []
-        for class_id in classes:
-            class_means.append(F.normalize(
-                global_features[labels == class_id].mean(0), dim=-1
-            ))
-        global_scores = global_logits(
-            global_features, torch.stack(class_means), self.logit_scale
-        )
-        global_scores = global_scores.scatter(
-            1, inverse[:, None],
-            (global_features * loo_global).sum(-1, keepdim=True) * self.logit_scale
-        )
-        local_scores, local_classes = local_leave_one_out_query_logits(
-            parts, patch_features, labels, self.model.reconstructor,
-            epsilon=self.epsilon, iterations=self.sinkhorn_steps,
-            logit_scale=self.logit_scale,
-            barycenter_iterations=self.barycenter_steps,
-        )
+    def _build_prototypes(self, global_features, local_features, labels):
+        classes, global_proto = normalized_class_means(global_features, labels)
+        local_classes, local_proto = normalized_class_means(local_features, labels, classes)
         if not torch.equal(classes, local_classes):
-            raise RuntimeError("Global/local LOO class ordering mismatch.")
-        joint_scores = self.model.fusion(global_scores, local_scores)
-        return output, global_scores, local_scores, joint_scores, inverse
+            raise RuntimeError("Global/local prototype class order differs.")
+        return classes, global_proto, local_proto
 
     def _train_base(self, trainset):
-        trainset.transform = self._train_transform()
-        labels = np.asarray(trainset.targets, dtype=np.int64)
+        """Extract frozen ViT once, then train the lightweight Prompt on cached features."""
+        started = time.time()
+        trainset.transform = self._eval_transform()
+        cache = self._extract_dataset(trainset, store_projected=False)
+        labels = cache["labels"].numpy()
         expected = np.arange(int(self.args.base_class))
         if not np.array_equal(np.unique(labels), expected):
             raise RuntimeError("Base training labels must be contiguous [0, base_class).")
-        classes_per_batch = min(
-            int(getattr(self.args, "vsmr_classes_per_batch", 16)),
-            int(self.args.base_class),
-        )
         sampler = BalancedBatchSampler(
-            labels, classes_per_batch,
-            int(getattr(self.args, "vsmr_samples_per_class", 4)), self.seed
+            labels,
+            min(int(getattr(self.args, "continual_classes_per_batch", 16)), int(self.args.base_class)),
+            int(getattr(self.args, "continual_samples_per_class", 4)),
+            self.seed,
         )
-        loader = self._loader(trainset, 1, batch_sampler=sampler)
         params = [p for p in self.model.parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(
             params,
@@ -377,27 +270,38 @@ class ContinualVSMRFSCILTrainer:
             weight_decay=float(getattr(self.args, "vsmr_weight_decay", 1e-4)),
         )
         epochs = int(self.args.epochs_base)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=max(1, epochs)
-        )
-        w_local = float(getattr(self.args, "vsmr_local_weight", 1.0))
-        w_joint = float(getattr(self.args, "vsmr_joint_weight", 1.0))
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs))
+        wg = float(getattr(self.args, "continual_global_loss_weight", 1.0))
+        wl = float(getattr(self.args, "continual_local_loss_weight", 1.0))
+        wj = float(getattr(self.args, "continual_joint_loss_weight", 1.0))
+        batch_size = int(getattr(self.args, "continual_feature_batch_size", 128))
         for epoch in range(epochs):
             sampler.set_epoch(epoch)
             self.model.train()
-            totals = {"loss": 0.0, "global": 0.0, "local": 0.0,
-                      "joint": 0.0}
+            totals = {"total": 0.0, "global": 0.0, "local": 0.0, "joint": 0.0}
             steps = 0
-            for images, batch_labels, _ in tqdm(loader, desc="Base {}/{}".format(epoch + 1, epochs)):
-                images = images.to(self.device, non_blocking=True)
-                labels = torch.as_tensor(batch_labels, device=self.device).long()
-                output, global_scores, local_scores, joint_scores, targets = self._batch_logits(
-                    *self.model.backbone(images), labels
+            for raw_indices in sampler:
+                indices = torch.as_tensor(raw_indices, dtype=torch.long)
+                cls = cache["cls"][indices].to(self.device, dtype=torch.float32, non_blocking=True)
+                patches = cache["patches"][indices].to(self.device, dtype=torch.float32, non_blocking=True)
+                labels_batch = cache["labels"][indices].to(self.device, non_blocking=True)
+                output = self.model.forward_features(cls, patches)
+                batch_classes = torch.unique(labels_batch, sorted=True)
+                query_indices = torch.arange(labels_batch.numel(), device=self.device)
+                global_scores = leave_one_out_cosine_logits(
+                    output["global_features"], labels_batch, query_indices,
+                    batch_classes, self.logit_scale,
                 )
-                global_loss = F.cross_entropy(global_scores, targets)
-                local_loss = F.cross_entropy(local_scores, targets)
-                joint_loss = F.cross_entropy(joint_scores, targets)
-                loss = global_loss + w_local * local_loss + w_joint * joint_loss
+                local_scores = leave_one_out_cosine_logits(
+                    output["local_features"], labels_batch, query_indices,
+                    batch_classes, self.logit_scale,
+                )
+                joint_scores = self.model.fusion(global_scores, local_scores)
+                targets = torch.searchsorted(batch_classes, labels_batch)
+                lg = F.cross_entropy(global_scores, targets)
+                ll = F.cross_entropy(local_scores, targets)
+                lj = F.cross_entropy(joint_scores, targets)
+                loss = wg * lg + wl * ll + wj * lj
                 if not torch.isfinite(loss):
                     raise FloatingPointError("Non-finite Base loss.")
                 optimizer.zero_grad(set_to_none=True)
@@ -407,352 +311,234 @@ class ContinualVSMRFSCILTrainer:
                         if not torch.isfinite(parameter.grad).all():
                             raise FloatingPointError("Non-finite gradient: " + name)
                 optimizer.step()
-                totals["loss"] += float(loss.detach())
-                totals["global"] += float(global_loss.detach())
-                totals["local"] += float(local_loss.detach())
-                totals["joint"] += float(joint_loss.detach())
+                totals["total"] += float(loss.detach())
+                totals["global"] += float(lg.detach())
+                totals["local"] += float(ll.detach())
+                totals["joint"] += float(lj.detach())
                 steps += 1
             scheduler.step()
-            record = {"stage": "base_train", "epoch": epoch + 1}
-            record.update({key: value / max(steps, 1) for key, value in totals.items()})
+            record = {"stage": "base_train", "epoch": epoch + 1, "steps": steps}
+            record.update({k: v / max(steps, 1) for k, v in totals.items()})
             record["fusion_alpha"] = float(self.model.fusion.alpha.detach())
             record["lr"] = scheduler.get_last_lr()[0]
             self._append_log(record)
 
         self.model.freeze_for_incremental()
-        base_cls, base_patches, base_labels = self._append_dataset_to_memory(
-            trainset, 0, is_base=True
-        )
-        cls, patches, labels = self._all_memory()
-        # Prototype construction is a post-Base cache operation, not another
-        # optimization step. Do not retain an autograd graph in the S0 bank.
+        # Select exactly five deterministic training samples per base class.
+        selected = []
+        rng = np.random.default_rng(self.seed)
+        for class_id in range(int(self.args.base_class)):
+            candidates = np.flatnonzero(labels == class_id)
+            if candidates.size < self.memory_per_class:
+                raise RuntimeError("Base class {} has too few samples.".format(class_id))
+            selected.extend(np.sort(rng.choice(
+                candidates, self.memory_per_class, replace=False
+            )).tolist())
+        selected = torch.tensor(sorted(selected), dtype=torch.long)
+        memory_cls = cache["cls"][selected].float().to(self.device)
+        memory_patches = cache["patches"][selected].float().to(self.device)
         with torch.no_grad():
-            self.classes, _, self.local_prototypes, base_parts = (
-                self._prototype_bank(cls, patches, labels)
+            keys, values = self.model.context.project_patches(memory_patches)
+            selected_labels = cache["labels"][selected]
+            sample_ids = ["base:index{}".format(int(i)) for i in selected.tolist()]
+            self.memory.append(
+                memory_cls, keys, values, selected_labels, sample_ids, 0, is_base=True
             )
-            self.local_prototypes = self.local_prototypes.detach()
-            # Base global prototypes use every real Base training image, while
-            # local OT memory uses the deterministic per-class feature budget.
-            base_global_features = self._global_features(base_cls.to(self.device))
-            base_global_labels = base_labels.to(self.device)
-            self.global_prototypes = torch.stack([
-                F.normalize(base_global_features[base_global_labels == class_id].mean(0), dim=-1)
-                for class_id in range(int(self.args.base_class))
-            ]).detach()
-        self._log_component_diagnostics(0, cls, patches, labels)
-        self.base_reference = {
-            record.sample_id: part.detach().cpu().clone()
-            for record, part in zip(self.memory.records, base_parts)
-        }
-        self.previous_reference = {
-            record.sample_id: part.detach().cpu().clone()
-            for record, part in zip(self.memory.records, base_parts)
-        }
-        torch.save({
-            "model": self.model.state_dict(),
-            "global_prototypes": self.global_prototypes.cpu(),
-            "local_prototypes": self.local_prototypes.cpu(),
-            "memory_metadata": self.memory.metadata(),
-            "feature_memory": self.memory.state_dict(),
-            "base_reference": self.base_reference,
-        }, os.path.join(self.save_dir, "continual_vsmr_base.pth"))
+            cls, all_keys, all_values, memory_labels = self._all_memory()
+            local_features = []
+            global_features = []
+            for start in range(0, len(self.memory), batch_size):
+                end = min(start + batch_size, len(self.memory))
+                output = self.model.forward_projected(
+                    cls[start:end], all_keys[start:end], all_values[start:end]
+                )
+                local_features.append(output["local_features"])
+                global_features.append(output["global_features"])
+            global_features = torch.cat(global_features)
+            local_features = torch.cat(local_features)
+            self.classes, self.global_prototypes, self.local_prototypes = self._build_prototypes(
+                global_features, local_features, memory_labels
+            )
+            for index, record in enumerate(self.memory.records):
+                self.sample_birth[record.sample_id] = local_features[index].detach().cpu().clone()
+            for row, class_id in enumerate(self.classes.tolist()):
+                self.prototype_birth[int(class_id)] = self.local_prototypes[row].detach().cpu().clone()
+        self._save_checkpoint("continual_vsmr_base.pth", stage=0)
+        memory_bytes = sum(
+            r.cls.numel() * r.cls.element_size()
+            + r.keys.numel() * r.keys.element_size()
+            + r.values.numel() * r.values.element_size()
+            for r in self.memory.records
+        )
         self._append_log({
-            "stage": "base_memory",
-            "base_memory_per_class": self.memory_per_base_class,
-            "memory_samples": len(self.memory),
-            "memory_bytes": int(sum(
-                record.cls.numel() * record.cls.element_size()
-                + record.patches.numel() * record.patches.element_size()
-                for record in self.memory.records
-            )),
+            "stage": "base_memory", "memory_samples": len(self.memory),
+            "memory_per_class": self.memory_per_class, "memory_bytes": int(memory_bytes),
+            "base_train_seconds": time.time() - started,
         })
 
-    def _balanced_memory_indices(self, labels, classes_per_batch, samples_per_class, epoch):
-        rng = np.random.default_rng(self.seed + 100003 * int(epoch))
-        labels_np = labels.detach().cpu().numpy()
-        mapping = {
-            int(cls): np.flatnonzero(labels_np == cls)
-            for cls in np.unique(labels_np)
-        }
-        classes = np.asarray(sorted(mapping))
-        cnum = min(int(classes_per_batch), len(classes))
-        snum = min(int(samples_per_class), min(len(v) for v in mapping.values()))
-        if cnum < 2 or snum < 2:
-            raise RuntimeError("Incremental replay needs >=2 classes and >=2 samples/class.")
-        batches = max(1, int(np.ceil(len(labels_np) / (cnum * snum))))
-        for _ in range(batches):
-            chosen = rng.choice(classes, cnum, replace=False)
-            batch = []
-            for class_id in chosen:
-                batch.extend(rng.choice(mapping[int(class_id)], snum, replace=False).tolist())
-            rng.shuffle(batch)
-            yield torch.tensor(batch, dtype=torch.long, device=labels.device)
-
-    def _make_reference(self, cls_features, patch_features, labels, ids):
-        with torch.no_grad():
-            parts = self._current_parts(cls_features, patch_features)[1]
-        return {
-            ids[i]: parts[i].detach().cpu().clone()
-            for i in range(len(ids))
-        }
-
     def _incremental_session(self, support_set, session):
-        expected = np.arange(
-            int(self.args.base_class) + (session - 1) * int(self.args.way),
-            int(self.args.base_class) + session * int(self.args.way),
-        )
+        started = time.time()
+        start_class = int(self.args.base_class) + (session - 1) * int(self.args.way)
+        expected = np.arange(start_class, start_class + int(self.args.way))
         support_labels = np.asarray(support_set.targets, dtype=np.int64)
         counts = {int(c): int((support_labels == c).sum()) for c in expected}
         if not np.array_equal(np.unique(support_labels), expected):
             raise RuntimeError("Session {} support classes mismatch: {}".format(session, counts))
-        if any(value != int(self.args.shot) for value in counts.values()):
+        if any(v != int(self.args.shot) for v in counts.values()):
             raise RuntimeError("Session {} requires exact K-shot: {}".format(session, counts))
-
-        previous_memory_size = len(self.memory)
-        self._append_dataset_to_memory(support_set, session, is_base=False)
-        expected_added = int(self.args.way) * int(self.args.shot)
-        if len(self.memory) - previous_memory_size != expected_added:
-            raise RuntimeError("Incremental memory did not append exactly the K-shot samples.")
-
-        cls, patches, labels = self._all_memory()
-        # Add only the current K-shot classes to the immutable global prototype
-        # bank. Previously admitted global prototypes are never recomputed.
-        new_global_features = self._global_features(
-            cls[previous_memory_size:]
+        previous_count = len(self.memory)
+        new = self._extract_dataset(support_set, store_projected=True)
+        self.memory.append(
+            new["cls"], new["keys"], new["values"], new["labels"],
+            ["session{}:index{}".format(session, i) for i in new["ids"]],
+            session, is_base=False,
         )
-        new_global_labels = labels[previous_memory_size:]
-        new_global_prototypes = []
-        for class_id in expected.tolist():
-            mask = new_global_labels == int(class_id)
-            new_global_prototypes.append(
-                F.normalize(new_global_features[mask].mean(0), dim=-1)
-            )
-        self.global_prototypes = torch.cat([
-            self.global_prototypes,
-            torch.stack(new_global_prototypes),
-        ], dim=0)
-        previous_prompt = self.model.decomposer.shared_prompts.detach().clone()
-        prompt = self.model.decomposer.shared_prompts
+        expected_added = int(self.args.way) * int(self.args.shot)
+        if len(self.memory) - previous_count != expected_added:
+            raise RuntimeError("Incremental memory did not append exactly K-shot samples.")
+
+        cls, keys, values, labels = self._all_memory()
+        prompt = self.model.context.shared_prompt
         self.model.assert_incremental_parameter_contract()
-
-        # Historical references are immutable and exist only for samples admitted
-        # before this Session. New support samples acquire references after training.
-        historical_count = previous_memory_size
-        reference_parts = []
-        reference_indices = []
-        for index in range(historical_count):
-            record = self.memory.records[index]
-            if record.sample_id not in self.base_reference and record.sample_id not in self.previous_reference:
-                raise RuntimeError("Missing permanent historical reference: " + record.sample_id)
-            reference = (
-                self.base_reference[record.sample_id]
-                if record.sample_id in self.base_reference
-                else self.previous_reference[record.sample_id]
-            )
-            reference_parts.append(reference.to(self.device))
-            reference_indices.append(index)
-        reference_parts = torch.stack(reference_parts)
-        reference_indices = torch.tensor(reference_indices, dtype=torch.long, device=self.device)
-
+        historical_indices = torch.arange(previous_count, device=self.device)
+        new_indices = torch.arange(previous_count, len(self.memory), device=self.device)
+        historical_ids = [self.memory.records[i].sample_id for i in range(previous_count)]
+        missing = [sid for sid in historical_ids if sid not in self.sample_birth]
+        if missing:
+            raise RuntimeError("Missing immutable sample Birth Reference: " + missing[0])
+        sample_reference = torch.stack([
+            self.sample_birth[sid].to(self.device) for sid in historical_ids
+        ])
+        old_classes = torch.unique(labels[:previous_count], sorted=True)
+        prototype_reference = torch.stack([
+            self.prototype_birth[int(c)].to(self.device) for c in old_classes.tolist()
+        ])
         optimizer = torch.optim.AdamW(
             [prompt],
             lr=float(getattr(self.args, "continual_prompt_lr", 1e-4)),
             weight_decay=float(getattr(self.args, "continual_prompt_weight_decay", 1e-4)),
         )
-        epochs = int(getattr(self.args, "epochs_new", 20))
-        w_local = float(getattr(self.args, "continual_local_weight", 1.0))
-        w_joint = float(getattr(self.args, "continual_joint_weight", 1.0))
-        w_history = float(getattr(self.args, "continual_history_consistency_weight", 0.1))
-        classes_per_batch = int(getattr(self.args, "continual_classes_per_batch", 16))
-        samples_per_class = int(getattr(self.args, "continual_samples_per_class", 4))
+        epochs = int(self.args.epochs_new)
+        wr = float(getattr(self.args, "continual_history_rep_weight", 0.1))
+        wp = float(getattr(self.args, "continual_history_proto_weight", 0.1))
+        feature_batch = int(getattr(self.args, "continual_feature_batch_size", 128))
+        previous_prompt = prompt.detach().clone()
 
         for epoch in range(epochs):
             self.model.train()
-            totals = {
-                "total": 0.0, "local": 0.0, "joint": 0.0, "history": 0.0,
-                "classification_prompt_grad_norm": 0.0,
-                "history_prompt_grad_norm_unweighted": 0.0,
-                "history_prompt_grad_norm_weighted": 0.0,
-                "weighted_history_to_classification_grad_ratio": 0.0,
-                "history_classification_grad_cosine": 0.0,
-            }
-            steps = 0
-            for indices in self._balanced_memory_indices(
-                labels, classes_per_batch, samples_per_class,
-                epoch + session * epochs
-            ):
-                query_cls = cls[indices]
-                query_patches = patches[indices]
-                query_labels = labels[indices]
-                output = self.model.decompose_features(query_cls, query_patches)
-
-                all_classes = torch.unique(labels, sorted=True)
-                all_parts = self._current_parts(cls, patches)[1]
-                candidate_parts = loo_class_prototypes(
-                    all_parts, labels, indices, all_classes,
-                    self.epsilon, self.sinkhorn_steps, self.barycenter_steps,
+            optimizer.zero_grad(set_to_none=True)
+            # Compute the current local representation for every stored sample
+            # once. Frozen K/V are already cached; only Prompt attention is rerun.
+            local_chunks = []
+            for start in range(0, len(self.memory), feature_batch):
+                end = min(start + feature_batch, len(self.memory))
+                local, _ = self.model.context.aggregate_projected(
+                    keys[start:end], values[start:end]
                 )
-                global_scores = global_logits(
-                    output["global_features"], self.global_prototypes, self.logit_scale
-                )
-                local_scores, _, _, _ = query_conditioned_reconstruction(
-                    output["parts"], query_patches, candidate_parts,
-                    self.model.reconstructor, self.epsilon,
-                    self.sinkhorn_steps, self.logit_scale,
-                )
-                joint_scores = self.model.fusion(global_scores, local_scores)
-                class_to_column = {
-                    int(class_id): position
-                    for position, class_id in enumerate(all_classes.tolist())
-                }
-                targets = torch.tensor(
-                    [class_to_column[int(label)] for label in query_labels.tolist()],
-                    dtype=torch.long, device=self.device,
-                )
-                local_loss = F.cross_entropy(local_scores, targets)
-                joint_loss = F.cross_entropy(joint_scores, targets)
-
-                # Re-decompose historical replay features in the student Prompt
-                # and compare them to their immutable first-admission references.
-                history_parts = all_parts[reference_indices]
-                history_loss = prompt_consistency_loss(
-                    history_parts,
-                    reference_parts,
-                    epsilon=self.epsilon,
-                    iterations=self.sinkhorn_steps,
-                )
-                classification_objective = w_local * local_loss + w_joint * joint_loss
-                gradient_diagnostics = prompt_gradient_diagnostics(
-                    classification_objective, history_loss, prompt, w_history
-                )
-                loss = classification_objective + w_history * history_loss
-                if not torch.isfinite(loss):
-                    raise FloatingPointError("Non-finite incremental loss.")
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                if prompt.grad is None or not torch.isfinite(prompt.grad).all():
-                    raise FloatingPointError("Shared Prompt gradient is absent or non-finite.")
-                for name, parameter in self.model.named_parameters():
-                    if name != "decomposer.shared_prompts" and parameter.grad is not None:
-                        raise RuntimeError("Frozen parameter received gradient: " + name)
-                optimizer.step()
-
-                totals["total"] += float(loss.detach())
-                totals["local"] += float(local_loss.detach())
-                totals["joint"] += float(joint_loss.detach())
-                totals["history"] += float(history_loss.detach())
-                for key, value in gradient_diagnostics.items():
-                    totals[key] += float(value)
-                steps += 1
-
-            record = {"stage": "incremental_train", "session": session, "epoch": epoch + 1}
-            record.update({key: value / max(steps, 1) for key, value in totals.items()})
-            record["prompt_delta_from_previous"] = float(
-                (prompt.detach() - previous_prompt).norm()
+                local_chunks.append(local)
+            local_features = torch.cat(local_chunks, dim=0)
+            # New support samples are queries; every seen class is a candidate.
+            query_indices = new_indices
+            classes = torch.unique(labels, sorted=True)
+            local_scores = leave_one_out_cosine_logits(
+                local_features, labels, query_indices, classes, self.logit_scale
             )
-            record.update(gradient_diagnostics)
-            self._append_log(record)
+            global_features = self.model.context.global_features(cls)
+            _, global_prototypes = normalized_class_means(global_features, labels, classes)
+            global_scores = F.normalize(global_features[query_indices], dim=-1) @ global_prototypes.t()
+            global_scores = global_scores * self.logit_scale
+            joint_scores = self.model.fusion(global_scores, local_scores)
+            targets = torch.searchsorted(classes, labels[query_indices])
+            classification_loss = F.cross_entropy(joint_scores, targets)
+            rep_loss = cosine_consistency_loss(
+                local_features[historical_indices], sample_reference
+            )
+            _, current_old_prototypes = normalized_class_means(
+                local_features[historical_indices], labels[historical_indices], old_classes
+            )
+            proto_loss = cosine_consistency_loss(
+                current_old_prototypes, prototype_reference
+            )
+            loss = classification_loss + wr * rep_loss + wp * proto_loss
+            if not torch.isfinite(loss):
+                raise FloatingPointError("Non-finite incremental objective.")
+            loss.backward()
+            if prompt.grad is None or not torch.isfinite(prompt.grad).all():
+                raise FloatingPointError("Shared Prompt gradient is absent or non-finite.")
+            for name, parameter in self.model.named_parameters():
+                if name != "context.shared_prompt" and parameter.grad is not None:
+                    raise RuntimeError("Frozen parameter received gradient: " + name)
+            optimizer.step()
+            self._append_log({
+                "stage": "incremental_train", "session": session, "epoch": epoch + 1,
+                "loss": float(loss.detach()),
+                "classification": float(classification_loss.detach()),
+                "history_representation": float(rep_loss.detach()),
+                "history_prototype": float(proto_loss.detach()),
+                "prompt_delta_from_previous": float((prompt.detach() - previous_prompt).norm()),
+            })
 
-        # Recompute every seen-class prototype in the current Prompt space.
-        # Historical references remain untouched; only this Session's samples
-        # receive their first and permanent component references.
+        # Recalibrate all seen-class local prototypes in the final Prompt space.
         with torch.no_grad():
-            self.classes, _, self.local_prototypes, final_parts = (
-                self._prototype_bank(cls, patches, labels)
+            local_chunks = []
+            for start in range(0, len(self.memory), feature_batch):
+                end = min(start + feature_batch, len(self.memory))
+                local, _ = self.model.context.aggregate_projected(
+                    keys[start:end], values[start:end]
+                )
+                local_chunks.append(local)
+            local_features = torch.cat(local_chunks)
+            global_features = self.model.context.global_features(cls)
+            self.classes, self.global_prototypes, self.local_prototypes = self._build_prototypes(
+                global_features, local_features, labels
             )
-            historical_drift = prompt_consistency_loss(
-                final_parts[reference_indices],
-                reference_parts,
-                epsilon=self.epsilon,
-                iterations=self.sinkhorn_steps,
-            )
-            for index in range(previous_memory_size, len(self.memory)):
-                sample_id = self.memory.records[index].sample_id
-                self.previous_reference[sample_id] = final_parts[index].cpu().clone()
-
-        self._log_component_diagnostics(session, cls, patches, labels)
+            for index in range(previous_count, len(self.memory)):
+                sid = self.memory.records[index].sample_id
+                self.sample_birth[sid] = local_features[index].cpu().clone()
+            for row, class_id in enumerate(self.classes.tolist()):
+                if int(class_id) not in self.prototype_birth:
+                    self.prototype_birth[int(class_id)] = self.local_prototypes[row].cpu().clone()
+        self._save_checkpoint("continual_vsmr_S{}.pth".format(session), stage=session)
+        self.timings["incremental_training_seconds"] = (
+            self.timings.get("incremental_training_seconds", 0.0) + time.time() - started
+        )
         self._append_log({
-            "stage": "memory_update",
-            "session": session,
-            "memory_samples": len(self.memory),
-            "classes": int(self.classes.numel()),
-            "prompt_delta_from_previous": float((prompt.detach() - previous_prompt).norm()),
-            "historical_reference_count": historical_count,
-            "new_reference_count": len(self.memory) - previous_memory_size,
-            "historical_component_drift": float(historical_drift),
+            "stage": "memory_update", "session": session,
+            "memory_samples": len(self.memory), "seen_classes": int(self.classes.numel()),
+            "historical_samples": previous_count,
+            "new_samples": len(self.memory) - previous_count,
+            "prompt_delta": float((prompt.detach() - previous_prompt).norm()),
+            "incremental_session_seconds": time.time() - started,
         })
 
     @torch.no_grad()
     def _evaluate(self, testset, session):
         original = getattr(testset, "transform", None)
-        if original is None:
-            raise RuntimeError("Test dataset must expose transform.")
         testset.transform = self._eval_transform()
-        loader = self._loader(testset, int(self.args.test_batch_size))
-        prediction_sets = {
-            "joint_ot_query": [], "global_only": [], "local_ot_query": [],
-            "ot_without_query_reconstruction": [], "fixed_index_query": [],
-        }
-        labels_all = []
+        loader = self._loader(testset, int(getattr(self.args, "continual_eval_batch_size", 128)))
+        predictions, labels_all = [], []
         self.model.eval()
         try:
             for images, labels, _ in tqdm(loader, desc="Evaluate S{}".format(session)):
-                output = self.model(images.to(self.device, non_blocking=True))
-                global_scores = global_logits(
-                    output["global_features"], self.global_prototypes, self.logit_scale
+                cls, patches = self.model.backbone(images.to(self.device, non_blocking=True))
+                output = self.model.forward_features(cls, patches)
+                global_scores = F.normalize(output["global_features"], dim=-1) @ self.global_prototypes.t()
+                local_scores = F.normalize(output["local_features"], dim=-1) @ self.local_prototypes.t()
+                scores = self.model.fusion(
+                    global_scores * self.logit_scale, local_scores * self.logit_scale
                 )
-                local_scores, _, _, _ = query_conditioned_reconstruction(
-                    output["parts"], output["patch_features"], self.local_prototypes,
-                    self.model.reconstructor, self.epsilon, self.sinkhorn_steps,
-                    self.logit_scale,
-                )
-                fixed_scores, _, _ = query_conditioned_fixed_index_reconstruction(
-                    output["parts"], output["patch_features"], self.local_prototypes,
-                    self.model.reconstructor, scale=self.logit_scale,
-                )
-                no_query_scores = local_logits(
-                    output["parts"], self.local_prototypes,
-                    epsilon=self.epsilon, iterations=self.sinkhorn_steps,
-                    scale=self.logit_scale,
-                )
-                joint_scores = self.model.fusion(global_scores, local_scores)
-                score_sets = {
-                    "joint_ot_query": joint_scores,
-                    "global_only": global_scores,
-                    "local_ot_query": local_scores,
-                    "ot_without_query_reconstruction": no_query_scores,
-                    "fixed_index_query": self.model.fusion(global_scores, fixed_scores),
-                }
-                for key, scores in score_sets.items():
-                    prediction_sets[key].append(scores.argmax(dim=1).cpu())
+                predictions.append(scores.argmax(-1).cpu())
                 labels_all.append(torch.as_tensor(labels, dtype=torch.long).cpu())
         finally:
             testset.transform = original
         labels = torch.cat(labels_all)
-        predictions = torch.cat(prediction_sets["joint_ot_query"])
+        predictions = torch.cat(predictions)
+        seen = int(self.args.base_class) + session * int(self.args.way)
         metrics = evaluate_session_predictions(
-            labels, predictions, int(self.args.base_class),
-            int(self.args.base_class + session * int(self.args.way) if session else self.args.base_class),
-            session, int(self.args.way),
+            labels, predictions, int(self.args.base_class), seen, session, int(self.args.way)
         )
-        ablation_metrics = {}
-        for key, batch_predictions in prediction_sets.items():
-            branch_predictions = torch.cat(batch_predictions)
-            branch_result = evaluate_session_predictions(
-                labels, branch_predictions, int(self.args.base_class),
-                int(self.args.base_class + session * int(self.args.way) if session else self.args.base_class),
-                session, int(self.args.way),
-            )
-            ablation_metrics[key] = {
-                "class_average_accuracy": branch_result["class_average_accuracy"],
-                "sample_accuracy": branch_result["sample_accuracy"],
-                "base_class_average_accuracy": branch_result["base_class_average_accuracy"],
-                "old_novel_class_average_accuracy": branch_result["old_novel_class_average_accuracy"],
-                "current_new_class_average_accuracy": branch_result["current_new_class_average_accuracy"],
-            }
-        metrics["inference_ablations"] = ablation_metrics
         metrics["stage"] = "evaluation"
-        metrics["method"] = "ContinualVSMR-Prompt"
+        metrics["method"] = "ContinualVSMR-Prompt-V2"
         self.confusion_matrices[session] = metrics.pop("confusion_matrix")
         self.session_records.append(metrics)
         self._append_log(metrics)
@@ -762,52 +548,46 @@ class ContinualVSMRFSCILTrainer:
         )
         return metrics
 
-    def _write_final_report(self, elapsed):
-        expected_sessions = int(self.args.sessions)
-        actual_sessions = len(self.session_records)
-        if actual_sessions != expected_sessions:
-            raise RuntimeError(
-                "Refusing to report partial FSCIL metrics: expected {} sessions "
-                "(S0..S{}), but evaluated {}.".format(
-                    expected_sessions, expected_sessions - 1, actual_sessions
-                )
-            )
-        summary = summarize_session_metrics(self.session_records)
-        summary.update({
-            "stage": "summary",
-            "method": "ContinualVSMR-Prompt",
-            "elapsed_minutes": float(elapsed / 60.0),
-            "base_memory_per_class": self.memory_per_base_class,
-            "memory_samples_final": len(self.memory),
-            "AA_definition": "Arithmetic mean of class-average accuracy over S0..ST.",
-            "PD_definition": "S0 class-average accuracy minus ST class-average accuracy; percentage-point difference.",
-        })
-        self._append_log(summary)
-        write_session_csv(
-            os.path.join(self.save_dir, "session_metrics.csv"),
-            self.session_records,
-        )
-        self._write_json(
-            os.path.join(self.save_dir, "session_metrics.json"),
-            self.session_records,
-        )
-        self._write_json(
-            os.path.join(self.save_dir, "summary.json"), summary
-        )
-        with open(os.path.join(self.save_dir, "summary.txt"), "w") as handle:
-            handle.write(format_session_table(self.session_records) + "\n")
-            handle.write("\nSample-weighted Top-1 is reported separately and is not used for AA/PD.\n")
+    def _save_checkpoint(self, filename, stage):
         torch.save({
-            "model": self.model.state_dict(),
-            "global_prototypes": self.global_prototypes.cpu(),
-            "local_prototypes": self.local_prototypes.cpu(),
+            "stage": int(stage), "model": self.model.state_dict(),
+            "global_prototypes": self.global_prototypes.detach().cpu(),
+            "local_prototypes": self.local_prototypes.detach().cpu(),
             "memory_metadata": self.memory.metadata(),
             "feature_memory": self.memory.state_dict(),
-            "base_reference": self.base_reference,
-            "previous_reference": self.previous_reference,
+            "sample_birth": self.sample_birth,
+            "prototype_birth": self.prototype_birth,
             "session_records": self.session_records,
-            "summary": summary,
-        }, os.path.join(self.save_dir, "continual_vsmr_final.pth"))
+            "timings": self.timings,
+        }, os.path.join(self.save_dir, filename))
+
+    def _write_final_report(self, elapsed):
+        if len(self.session_records) != int(self.args.sessions):
+            raise RuntimeError("Refusing to report incomplete S0..ST metrics.")
+        summary = summarize_session_metrics(self.session_records)
+        base_drop = (
+            float(self.session_records[0]["base_class_average_accuracy"])
+            - float(self.session_records[-1]["base_class_average_accuracy"])
+        )
+        summary.update({
+            "stage": "summary", "method": "ContinualVSMR-Prompt-V2",
+            "elapsed_minutes": float(elapsed / 60.0),
+            "base_class_accuracy_drop": base_drop,
+            "base_class_accuracy_drop_percentage_points": 100.0 * base_drop,
+            "memory_per_class": self.memory_per_class,
+            "memory_samples_final": len(self.memory),
+            "timings": self.timings,
+            "AA_definition": "Arithmetic mean of all-seen-class macro Top-1 accuracy over S0..ST.",
+            "PD_definition": "S0 all-seen-class macro accuracy minus ST all-seen-class macro accuracy.",
+            "base_class_drop_definition": "S0 base-class macro accuracy minus ST base-class macro accuracy.",
+        })
+        self._append_log(summary)
+        write_session_csv(os.path.join(self.save_dir, "session_metrics.csv"), self.session_records)
+        self._write_json(os.path.join(self.save_dir, "session_metrics.json"), self.session_records)
+        self._write_json(os.path.join(self.save_dir, "summary.json"), summary)
+        with open(os.path.join(self.save_dir, "summary.txt"), "w") as handle:
+            handle.write(format_session_table(self.session_records) + "\n")
+        self._save_checkpoint("continual_vsmr_final.pth", stage=int(self.args.sessions) - 1)
         print("\n" + format_session_table(self.session_records))
         return summary
 
