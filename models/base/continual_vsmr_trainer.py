@@ -131,6 +131,7 @@ class ContinualVSMRFSCILTrainer:
             "base_class", "way", "shot", "sessions", "seed", "gpu",
             "epochs_base", "epochs_new", "num_workers", "test_batch_size",
             "out", "vit", "vsmr_prompt_temperature", "vsmr_logit_scale",
+            "vsmr_lr", "vsmr_weight_decay",
             "continual_base_memory_per_class", "continual_prompt_lr",
             "continual_prompt_weight_decay", "continual_history_rep_weight",
             "continual_history_proto_weight", "continual_global_init",
