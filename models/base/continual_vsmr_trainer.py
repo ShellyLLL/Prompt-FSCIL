@@ -444,9 +444,9 @@ class ContinualVSMRFSCILTrainer:
                 local_features, labels, query_indices, classes, self.logit_scale
             )
             global_features = self.model.context.global_features(cls)
-            _, global_prototypes = normalized_class_means(global_features, labels, classes)
-            global_scores = F.normalize(global_features[query_indices], dim=-1) @ global_prototypes.t()
-            global_scores = global_scores * self.logit_scale
+            global_scores = leave_one_out_cosine_logits(
+                global_features, labels, query_indices, classes, self.logit_scale
+            )
             joint_scores = self.model.fusion(global_scores, local_scores)
             targets = torch.searchsorted(classes, labels[query_indices])
             classification_loss = F.cross_entropy(joint_scores, targets)
