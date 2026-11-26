@@ -374,7 +374,7 @@ class ContinualVSMRFSCILTrainer:
                 self.sample_birth[record.sample_id] = local_features[index].detach().cpu().clone()
             for row, class_id in enumerate(self.classes.tolist()):
                 self.prototype_birth[int(class_id)] = self.local_prototypes[row].detach().cpu().clone()
-        self._save_checkpoint("continual_vsmr_base.pth", stage=0)
+        self._save_checkpoint("continual_vsmr_base.pth", stage=0, include_memory=True)
         memory_bytes = sum(
             r.cls.numel() * r.cls.element_size()
             + r.keys.numel() * r.keys.element_size()
@@ -509,7 +509,7 @@ class ContinualVSMRFSCILTrainer:
             for row, class_id in enumerate(self.classes.tolist()):
                 if int(class_id) not in self.prototype_birth:
                     self.prototype_birth[int(class_id)] = self.local_prototypes[row].cpu().clone()
-        self._save_checkpoint("continual_vsmr_S{}.pth".format(session), stage=session)
+        self._save_checkpoint("continual_vsmr_S{}.pth".format(session), stage=session, include_memory=False)
         self.timings["incremental_training_seconds"] = (
             self.timings.get("incremental_training_seconds", 0.0) + time.time() - started
         )
@@ -609,18 +609,23 @@ class ContinualVSMRFSCILTrainer:
         )
         return metrics
 
-    def _save_checkpoint(self, filename, stage):
-        torch.save({
+    def _save_checkpoint(self, filename, stage, include_memory=False):
+        state = {
             "stage": int(stage), "model": self.model.state_dict(),
             "global_prototypes": self.global_prototypes.detach().cpu(),
             "local_prototypes": self.local_prototypes.detach().cpu(),
-            "memory_metadata": self.memory.metadata(),
-            "feature_memory": self.memory.state_dict(),
             "sample_birth": self.sample_birth,
             "prototype_birth": self.prototype_birth,
             "session_records": self.session_records,
             "timings": self.timings,
-        }, os.path.join(self.save_dir, filename))
+            "memory_included": bool(include_memory),
+        }
+        # Avoid serializing hundreds of MB of unchanged replay K/V after every
+        # session. The Base and final checkpoints remain self-contained.
+        if include_memory:
+            state["memory_metadata"] = self.memory.metadata()
+            state["feature_memory"] = self.memory.state_dict()
+        torch.save(state, os.path.join(self.save_dir, filename))
 
     def _write_final_report(self, elapsed):
         if len(self.session_records) != int(self.args.sessions):
@@ -648,7 +653,7 @@ class ContinualVSMRFSCILTrainer:
         self._write_json(os.path.join(self.save_dir, "summary.json"), summary)
         with open(os.path.join(self.save_dir, "summary.txt"), "w") as handle:
             handle.write(format_session_table(self.session_records) + "\n")
-        self._save_checkpoint("continual_vsmr_final.pth", stage=int(self.args.sessions) - 1)
+        self._save_checkpoint("continual_vsmr_final.pth", stage=int(self.args.sessions) - 1, include_memory=True)
         print("\n" + format_session_table(self.session_records))
         return summary
 
