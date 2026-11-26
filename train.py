@@ -27,9 +27,17 @@ def get_command_line_parser():
     parser.add_argument('--continual_prompt_weight_decay', type=float, default=1e-4)
     parser.add_argument('--continual_local_weight', type=float, default=1.0)
     parser.add_argument('--continual_joint_weight', type=float, default=1.0)
-    parser.add_argument('--continual_history_consistency_weight', type=float, default=0.1)
+    # Continual VSMR V2.0: single Prompt and dual historical anchors.
+    parser.add_argument('--continual_history_rep_weight', type=float, default=0.1)
+    parser.add_argument('--continual_history_proto_weight', type=float, default=0.1)
+    parser.add_argument('--continual_global_init', type=float, default=0.5)
+    parser.add_argument('--continual_global_loss_weight', type=float, default=1.0)
+    parser.add_argument('--continual_local_loss_weight', type=float, default=1.0)
+    parser.add_argument('--continual_joint_loss_weight', type=float, default=1.0)
     parser.add_argument('--continual_classes_per_batch', type=int, default=16)
     parser.add_argument('--continual_samples_per_class', type=int, default=4)
+    parser.add_argument('--continual_feature_batch_size', type=int, default=128)
+    parser.add_argument('--continual_eval_batch_size', type=int, default=128)
     parser.add_argument('--vsmr_prompt_temperature', type=float, default=1.0)
     # Continual VSMR-Prompt diagnostic sampling (training-memory only).
     parser.add_argument('--vsmr_diagnostics_max_samples', type=int, default=48)
