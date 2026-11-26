@@ -500,8 +500,8 @@ class ContinualVSMRFSCILTrainer:
                 )
                 local_chunks.append(local)
             local_features = torch.cat(local_chunks)
-            self.classes, _, self.local_prototypes = self._build_prototypes(
-                self.model.context.global_features(cls), local_features, labels
+            self.classes, self.local_prototypes = normalized_class_means(
+                local_features, labels
             )
             # The global branch is frozen and its historical prototypes are
             # immutable; append only prototypes for classes introduced now.
