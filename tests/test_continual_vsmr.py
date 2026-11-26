@@ -201,6 +201,16 @@ class TestVSMRSyntheticPipeline(unittest.TestCase):
             self.assertEqual(trainer.classes.tolist(), [0, 1])
             self.assertEqual(trainer.global_prototypes.shape, (2, 8))
             self.assertEqual(trainer.local_prototypes.shape, (2, 8))
+            global_birth = trainer.global_prototypes.clone()
+            prototype_birth = {
+                key: value.clone() for key, value in trainer.prototype_birth.items()
+            }
+            base_checkpoint = torch.load(
+                os.path.join(directory, "continual_vsmr_base.pth"),
+                map_location="cpu", weights_only=False,
+            )
+            self.assertTrue(base_checkpoint["memory_included"])
+            self.assertEqual(len(base_checkpoint["feature_memory"]), 10)
             trainer._evaluate(TinyImageDataset([0, 1], seed=13), 0)
 
             support = TinyImageDataset([2] * 5, seed=14)
