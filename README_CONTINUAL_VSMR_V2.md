@@ -121,3 +121,9 @@ python -m unittest discover -s tests -p 'test_*vsmr*.py' -v
 
 A successful synthetic test is an architecture check, not evidence of AA/PD
 improvement. CUB-200 S0-S10 is the next real-data acceptance stage.
+
+
+Base and final checkpoints are self-contained and include the FP16 feature memory.
+Intermediate per-session checkpoints intentionally omit the unchanged K/V replay
+memory to avoid repeatedly writing hundreds of MB; they retain model parameters,
+current prototypes, immutable anchors, session metrics, and timing records.
