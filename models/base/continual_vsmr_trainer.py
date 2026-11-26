@@ -218,10 +218,8 @@ class ContinualVSMRFSCILTrainer:
                     cls_cache = torch.empty((size, dim), dtype=torch.float16)
                     labels_cache = torch.empty((size,), dtype=torch.long)
                     if store_projected:
-                        keys, values = self.model.context.project_patches(patches)
-                        key_cache = torch.empty(
-                            (size,) + tuple(keys.shape[1:]), dtype=torch.float16
-                        )
+                        projected_shape = (size, int(patches.shape[1]), int(patches.shape[2]))
+                        key_cache = torch.empty(projected_shape, dtype=torch.float16)
                         value_cache = torch.empty_like(key_cache)
                     else:
                         patch_cache = torch.empty(
