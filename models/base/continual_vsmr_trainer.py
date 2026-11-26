@@ -500,10 +500,20 @@ class ContinualVSMRFSCILTrainer:
                 )
                 local_chunks.append(local)
             local_features = torch.cat(local_chunks)
-            global_features = self.model.context.global_features(cls)
-            self.classes, self.global_prototypes, self.local_prototypes = self._build_prototypes(
-                global_features, local_features, labels
+            self.classes, _, self.local_prototypes = self._build_prototypes(
+                self.model.context.global_features(cls), local_features, labels
             )
+            # The global branch is frozen and its historical prototypes are
+            # immutable; append only prototypes for classes introduced now.
+            new_global_features = self.model.context.global_features(cls[new_indices])
+            _, new_global_prototypes = normalized_class_means(
+                new_global_features, labels[new_indices]
+            )
+            self.global_prototypes = torch.cat(
+                [self.global_prototypes, new_global_prototypes], dim=0
+            )
+            if self.global_prototypes.shape[0] != self.classes.numel():
+                raise RuntimeError("Global prototype bank does not cover all seen classes.")
             for index in range(previous_count, len(self.memory)):
                 sid = self.memory.records[index].sample_id
                 self.sample_birth[sid] = local_features[index].cpu().clone()
