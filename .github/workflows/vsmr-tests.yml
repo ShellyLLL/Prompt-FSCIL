@@ -27,7 +27,7 @@ jobs:
       - name: Test VSMR Prompt architecture
         run: |
           cd tests
-          python -m unittest test_continual_vsmr.TestVSMRPromptArchitecture -v
+          PYTHONPATH=.. python -m unittest test_continual_vsmr.TestVSMRPromptArchitecture -v
       - name: Test VSMR prototype utilities
         run: |
           cd tests
