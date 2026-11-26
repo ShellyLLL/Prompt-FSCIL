@@ -116,6 +116,7 @@ class ContinualVSMRFSCILTrainer:
         self.session_records = []
         self.confusion_matrices = {}
         self.timings = {}
+        self.test_cache = None
         root = getattr(args, "out", None) or "ContinualVSMR"
         repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         root = root if os.path.isabs(root) else os.path.join(repo_root, "checkpoint", root)
@@ -511,6 +512,56 @@ class ContinualVSMRFSCILTrainer:
             "incremental_session_seconds": time.time() - started,
         })
 
+    def _prepare_test_cache(self, testset):
+        """Encode the complete held-out test split once; never use it for updates."""
+        started = time.time()
+        self.test_cache = self._extract_dataset(testset, store_projected=True)
+        self.timings["test_feature_cache_seconds"] = time.time() - started
+        self._append_log({
+            "stage": "test_feature_cache",
+            "test_samples": int(self.test_cache["labels"].numel()),
+            "seconds": self.timings["test_feature_cache_seconds"],
+        })
+
+    @torch.no_grad()
+    def _evaluate_cached(self, session):
+        cache = self.test_cache
+        seen = int(self.args.base_class) + session * int(self.args.way)
+        selected = torch.nonzero(cache["labels"] < seen, as_tuple=False).flatten()
+        if selected.numel() == 0:
+            raise RuntimeError("No cached test samples for Session {}.".format(session))
+        predictions, labels_all = [], []
+        batch_size = int(getattr(self.args, "continual_eval_batch_size", 128))
+        self.model.eval()
+        for start in range(0, selected.numel(), batch_size):
+            idx = selected[start:start + batch_size]
+            cls = cache["cls"][idx].to(self.device, dtype=torch.float32, non_blocking=True)
+            keys = cache["keys"][idx].to(self.device, dtype=torch.float16, non_blocking=True)
+            values = cache["values"][idx].to(self.device, dtype=torch.float16, non_blocking=True)
+            output = self.model.forward_projected(cls, keys, values)
+            global_scores = F.normalize(output["global_features"], dim=-1) @ self.global_prototypes.t()
+            local_scores = F.normalize(output["local_features"], dim=-1) @ self.local_prototypes.t()
+            scores = self.model.fusion(
+                global_scores * self.logit_scale, local_scores * self.logit_scale
+            )
+            predictions.append(scores.argmax(-1).cpu())
+            labels_all.append(cache["labels"][idx].cpu())
+        labels = torch.cat(labels_all)
+        predictions = torch.cat(predictions)
+        metrics = evaluate_session_predictions(
+            labels, predictions, int(self.args.base_class), seen, session, int(self.args.way)
+        )
+        metrics["stage"] = "evaluation"
+        metrics["method"] = "ContinualVSMR-Prompt-V2"
+        self.confusion_matrices[session] = metrics.pop("confusion_matrix")
+        self.session_records.append(metrics)
+        self._append_log(metrics)
+        write_confusion_csv(
+            os.path.join(self.save_dir, "confusion_S{}.csv".format(session)),
+            self.confusion_matrices[session],
+        )
+        return metrics
+
     @torch.no_grad()
     def _evaluate(self, testset, session):
         original = getattr(testset, "transform", None)
@@ -595,11 +646,16 @@ class ContinualVSMRFSCILTrainer:
         started = time.time()
         trainset, _, testloader = get_base_dataloader(self.args)
         self._train_base(trainset)
-        self._evaluate(testloader.dataset, 0)
+        # Cache the complete held-out test split once. All later session
+        # evaluations reuse frozen CLS/K/V features; only Prompt aggregation
+        # and prototype scoring are recomputed.
+        _, _, final_testloader = get_new_dataloader(self.args, int(self.args.sessions) - 1)
+        self._prepare_test_cache(final_testloader.dataset)
+        self._evaluate_cached(0)
         for session in range(1, int(self.args.sessions)):
-            support_set, _, testloader = get_new_dataloader(self.args, session)
+            support_set, _, _ = get_new_dataloader(self.args, session)
             self._incremental_session(support_set, session)
-            self._evaluate(testloader.dataset, session)
+            self._evaluate_cached(session)
         summary = self._write_final_report(time.time() - started)
         print("[ContinualVSMR] summary={}".format(os.path.join(self.save_dir, "summary.txt")))
         return summary
