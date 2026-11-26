@@ -204,6 +204,7 @@ class ContinualVSMRFSCILTrainer:
         loader = self._loader(
             dataset, batch_size or int(getattr(self.args, "continual_feature_batch_size", 128))
         )
+        started = time.time()
         size = len(dataset)
         cls_cache = labels_cache = key_cache = value_cache = patch_cache = None
         ids_all = [None] * size
