@@ -11,3 +11,13 @@ python train.py --method vsmr -project base -dataset cub200 -vit \
 ```
 
 See [README_VSMR.md](README_VSMR.md) for the architecture, full objective, incremental protocol, diagnostics, experiment settings, and test commands.
+
+
+## Continual VSMR-Prompt V2.0
+
+The separate `--method continual_vsmr` implementation on
+`feature/continual-vsmr-peft` uses one shared Prompt, cached frozen ViT
+features, global/local mean prototypes, and immutable historical representation
+and prototype anchors. It does not use the legacy VSMR OT/reconstruction graph.
+See [README_CONTINUAL_VSMR_V2.md](README_CONTINUAL_VSMR_V2.md) for its
+architecture, runtime/memory plan, launcher, and acceptance tests.
