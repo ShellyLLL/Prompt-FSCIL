@@ -24,10 +24,14 @@ jobs:
       - name: Compile VSMR implementation
         run: |
           python -m py_compile train.py models/base/continual_vsmr.py models/base/continual_vsmr_metrics.py models/base/continual_vsmr_model.py models/base/continual_vsmr_trainer.py models/base/vsmr_modules.py models/base/vsmr_losses.py models/base/vsmr_resynthesis.py models/base/vsmr_diagnostics.py
-      - name: Test VSMR Prompt architecture
+      - name: Test single Prompt and incremental freeze contract
         run: |
           cd tests
-          PYTHONPATH=.. python -m unittest test_continual_vsmr.TestVSMRPromptArchitecture -v
+          PYTHONPATH=.. python -m unittest test_continual_vsmr.TestVSMRPromptArchitecture.test_single_prompt_and_incremental_parameter_contract -v
+      - name: Test cached and direct Prompt context equivalence
+        run: |
+          cd tests
+          PYTHONPATH=.. python -m unittest test_continual_vsmr.TestVSMRPromptArchitecture.test_projected_context_matches_raw_context -v
       - name: Test VSMR prototype utilities
         run: |
           cd tests
