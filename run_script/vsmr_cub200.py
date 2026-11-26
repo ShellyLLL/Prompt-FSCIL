@@ -22,6 +22,7 @@ ARGS = [
     "-gpu", "0",
     "-seed", "1",
     "-epochs_base", "50",
+    "-epochs_new", "10",
     "-num_workers", "4",
     "-test_batch_size", "64",
     "--continual_classes_per_batch", "16",
