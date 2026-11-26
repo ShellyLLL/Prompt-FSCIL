@@ -93,10 +93,12 @@ def normalized_class_means(features, labels, classes=None):
 
 
 def leave_one_out_cosine_logits(features, labels, query_indices, classes, scale=16.0):
-    """Cosine logits with each query removed from its own class mean prototype."""
+    """Vectorized cosine logits with each query removed from its own class mean."""
     if features.ndim != 2 or labels.ndim != 1 or features.shape[0] != labels.numel():
         raise ValueError("Expected features [N,D] and labels [N].")
-    query_indices = torch.as_tensor(query_indices, dtype=torch.long, device=labels.device).reshape(-1)
+    query_indices = torch.as_tensor(
+        query_indices, dtype=torch.long, device=labels.device
+    ).reshape(-1)
     classes = torch.as_tensor(classes, dtype=torch.long, device=labels.device).reshape(-1)
     if query_indices.numel() == 0 or torch.any(query_indices < 0) or torch.any(query_indices >= labels.numel()):
         raise ValueError("Query indices must be non-empty and in range.")
@@ -105,23 +107,25 @@ def leave_one_out_cosine_logits(features, labels, query_indices, classes, scale=
     observed = torch.unique(labels, sorted=True)
     if not torch.equal(classes, observed):
         raise ValueError("Classes must exactly match labels.")
-    counts = torch.stack([(labels == c).sum() for c in classes])
+    inverse = torch.searchsorted(classes, labels)
+    counts = torch.bincount(inverse, minlength=classes.numel())
     if torch.any(counts < 2):
         raise ValueError("LOO classification requires at least two samples per class.")
-    _, prototypes = normalized_class_means(features, labels, classes)
-    scores = F.normalize(features[query_indices], dim=-1) @ prototypes.t()
-    scores = scores * float(scale)
-    class_to_column = {int(c): i for i, c in enumerate(classes.tolist())}
-    for row, index in enumerate(query_indices.tolist()):
-        class_id = int(labels[index])
-        mask = labels == class_id
-        retained = features[mask]
-        own = retained.sum(0) - features[index]
-        own = F.normalize(own / float(retained.shape[0] - 1), dim=-1)
-        scores[row, class_to_column[class_id]] = (
-            F.normalize(features[index], dim=-1) * own
-        ).sum() * float(scale)
-    return scores
+
+    # One class-wise reduction replaces per-query/per-class Python loops.
+    sums = features.new_zeros((classes.numel(), features.shape[-1])).index_add(
+        0, inverse, features
+    )
+    prototypes = F.normalize(sums / counts.to(features.dtype).unsqueeze(1), dim=-1)
+    query_features = F.normalize(features[query_indices], dim=-1)
+    scores = (query_features @ prototypes.t()) * float(scale)
+
+    query_classes = inverse[query_indices]
+    own_sums = sums[query_classes] - features[query_indices]
+    own_counts = (counts[query_classes] - 1).to(features.dtype).unsqueeze(1)
+    own_prototypes = F.normalize(own_sums / own_counts, dim=-1)
+    own_scores = (query_features * own_prototypes).sum(-1) * float(scale)
+    return scores.scatter(1, query_classes.unsqueeze(1), own_scores.unsqueeze(1))
 
 
 def cosine_consistency_loss(student, reference):
