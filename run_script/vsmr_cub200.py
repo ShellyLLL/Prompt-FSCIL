@@ -24,8 +24,12 @@ ARGS = [
     "-epochs_base", "50",
     "-num_workers", "4",
     "-test_batch_size", "64",
-    "--vsmr_classes_per_batch", "16",
-    "--vsmr_samples_per_class", "4",
+    "--continual_classes_per_batch", "16",
+    "--continual_samples_per_class", "4",
+    "--continual_feature_batch_size", "128",
+    "--continual_eval_batch_size", "128",
+    "--continual_history_rep_weight", "0.1",
+    "--continual_history_proto_weight", "0.1",
     "-out", "VSMR",
 ]
 
