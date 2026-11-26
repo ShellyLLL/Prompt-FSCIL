@@ -204,39 +204,51 @@ class ContinualVSMRFSCILTrainer:
         loader = self._loader(
             dataset, batch_size or int(getattr(self.args, "continual_feature_batch_size", 128))
         )
-        cls_all, patch_all, key_all, value_all = [], [], [], []
-        labels_all, ids_all = [], []
+        size = len(dataset)
+        cls_cache = labels_cache = key_cache = value_cache = patch_cache = None
+        ids_all = [None] * size
         self.model.eval()
-        started = time.time()
         try:
             for images, labels, indices in tqdm(loader, desc="Frozen ViT feature extraction"):
                 images = images.to(self.device, non_blocking=True)
                 cls, patches = self.model.backbone(images)
-                cls_all.append(cls.cpu().half())
-                labels_all.append(torch.as_tensor(labels, dtype=torch.long).cpu())
-                ids_all.extend(int(i) for i in indices.tolist())
+                indices_cpu = indices.long().cpu()
+                if cls_cache is None:
+                    dim = int(cls.shape[-1])
+                    cls_cache = torch.empty((size, dim), dtype=torch.float16)
+                    labels_cache = torch.empty((size,), dtype=torch.long)
+                    if store_projected:
+                        keys, values = self.model.context.project_patches(patches)
+                        key_cache = torch.empty(
+                            (size,) + tuple(keys.shape[1:]), dtype=torch.float16
+                        )
+                        value_cache = torch.empty_like(key_cache)
+                    else:
+                        patch_cache = torch.empty(
+                            (size,) + tuple(patches.shape[1:]), dtype=torch.float16
+                        )
+                cls_cache[indices_cpu] = cls.detach().cpu().half()
+                labels_cache[indices_cpu] = torch.as_tensor(labels, dtype=torch.long).cpu()
+                for row, index in enumerate(indices_cpu.tolist()):
+                    ids_all[index] = int(index)
                 if store_projected:
                     keys, values = self.model.context.project_patches(patches)
-                    key_all.append(keys.cpu().half())
-                    value_all.append(values.cpu().half())
+                    key_cache[indices_cpu] = keys.detach().cpu().half()
+                    value_cache[indices_cpu] = values.detach().cpu().half()
                 else:
-                    patch_all.append(patches.cpu().half())
+                    patch_cache[indices_cpu] = patches.detach().cpu().half()
         finally:
             dataset.transform = original
-        if not labels_all:
+        if cls_cache is None or labels_cache is None:
             raise RuntimeError("Cannot extract features from an empty dataset.")
         self.timings["feature_extraction_seconds"] = (
             self.timings.get("feature_extraction_seconds", 0.0) + time.time() - started
         )
-        result = {
-            "cls": torch.cat(cls_all),
-            "labels": torch.cat(labels_all),
-            "ids": ids_all,
-        }
+        result = {"cls": cls_cache, "labels": labels_cache, "ids": ids_all}
         if store_projected:
-            result["keys"], result["values"] = torch.cat(key_all), torch.cat(value_all)
+            result["keys"], result["values"] = key_cache, value_cache
         else:
-            result["patches"] = torch.cat(patch_all)
+            result["patches"] = patch_cache
         return result
 
     def _all_memory(self):
