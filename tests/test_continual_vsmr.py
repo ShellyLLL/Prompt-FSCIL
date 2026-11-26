@@ -191,6 +191,8 @@ class TestVSMRSyntheticPipeline(unittest.TestCase):
         trainer.confusion_matrices = {}
         trainer.timings = {}
         trainer._append_log = lambda record: None
+        # Synthetic tensors are already transformed; bypass PIL-only transforms.
+        trainer._eval_transform = lambda: (lambda image: image)
         with tempfile.TemporaryDirectory() as directory:
             trainer.save_dir = directory
             base = TinyImageDataset([0] * 6 + [1] * 6, seed=12)
