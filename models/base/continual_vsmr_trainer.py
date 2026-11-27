@@ -290,6 +290,8 @@ class ContinualVSMRFSCILTrainer:
         batch_size = int(getattr(self.args, "continual_feature_batch_size", 128))
         for epoch in range(epochs):
             epoch_started = time.perf_counter()
+            if self.device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(self.device)
             sampler.set_epoch(epoch)
             self.model.train()
             totals = {"total": 0.0, "global": 0.0, "local": 0.0, "joint": 0.0}
@@ -458,6 +460,8 @@ class ContinualVSMRFSCILTrainer:
 
         for epoch in range(epochs):
             epoch_started = time.perf_counter()
+            if self.device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(self.device)
             self.model.train()
             optimizer.zero_grad(set_to_none=True)
             # Compute the current local representation for every stored sample
@@ -502,6 +506,10 @@ class ContinualVSMRFSCILTrainer:
             self._append_log({
                 "stage": "incremental_train", "session": session, "epoch": epoch + 1,
                 "epoch_seconds": time.perf_counter() - epoch_started,
+                "cuda_peak_allocated_mb": (
+                    torch.cuda.max_memory_allocated(self.device) / (1024.0 ** 2)
+                    if self.device.type == "cuda" else None
+                ),
                 "loss": float(loss.detach()),
                 "classification": float(classification_loss.detach()),
                 "history_representation": float(rep_loss.detach()),
