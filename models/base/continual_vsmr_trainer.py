@@ -289,6 +289,7 @@ class ContinualVSMRFSCILTrainer:
         wj = float(getattr(self.args, "continual_joint_loss_weight", 1.0))
         batch_size = int(getattr(self.args, "continual_feature_batch_size", 128))
         for epoch in range(epochs):
+            epoch_started = time.perf_counter()
             sampler.set_epoch(epoch)
             self.model.train()
             totals = {"total": 0.0, "global": 0.0, "local": 0.0, "joint": 0.0}
@@ -334,6 +335,13 @@ class ContinualVSMRFSCILTrainer:
             record.update({k: v / max(steps, 1) for k, v in totals.items()})
             record["fusion_alpha"] = float(self.model.fusion.alpha.detach())
             record["lr"] = scheduler.get_last_lr()[0]
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            record["epoch_seconds"] = time.perf_counter() - epoch_started
+            if self.device.type == "cuda":
+                record["cuda_peak_allocated_mb"] = (
+                    torch.cuda.max_memory_allocated(self.device) / (1024.0 ** 2)
+                )
             self._append_log(record)
 
         self.model.freeze_for_incremental()
@@ -449,6 +457,7 @@ class ContinualVSMRFSCILTrainer:
         previous_prompt = prompt.detach().clone()
 
         for epoch in range(epochs):
+            epoch_started = time.perf_counter()
             self.model.train()
             optimizer.zero_grad(set_to_none=True)
             # Compute the current local representation for every stored sample
@@ -488,8 +497,11 @@ class ContinualVSMRFSCILTrainer:
                 if name != "context.shared_prompt" and parameter.grad is not None:
                     raise RuntimeError("Frozen parameter received gradient: " + name)
             optimizer.step()
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
             self._append_log({
                 "stage": "incremental_train", "session": session, "epoch": epoch + 1,
+                "epoch_seconds": time.perf_counter() - epoch_started,
                 "loss": float(loss.detach()),
                 "classification": float(classification_loss.detach()),
                 "history_representation": float(rep_loss.detach()),
@@ -545,9 +557,15 @@ class ContinualVSMRFSCILTrainer:
         started = time.time()
         self.test_cache = self._extract_dataset(testset, store_projected=True)
         self.timings["test_feature_cache_seconds"] = time.time() - started
+        cache_bytes = sum(
+            value.numel() * value.element_size()
+            for value in self.test_cache.values() if torch.is_tensor(value)
+        )
         self._append_log({
             "stage": "test_feature_cache",
             "test_samples": int(self.test_cache["labels"].numel()),
+            "cache_bytes": int(cache_bytes),
+            "cache_gib": float(cache_bytes / (1024.0 ** 3)),
             "seconds": self.timings["test_feature_cache_seconds"],
         })
 
