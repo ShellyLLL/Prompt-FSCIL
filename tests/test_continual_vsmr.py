@@ -205,6 +205,9 @@ class TestVSMRSyntheticPipeline(unittest.TestCase):
             prototype_birth = {
                 key: value.clone() for key, value in trainer.prototype_birth.items()
             }
+            sample_birth = {
+                key: value.clone() for key, value in trainer.sample_birth.items()
+            }
             base_checkpoint = torch.load(
                 os.path.join(directory, "continual_vsmr_base.pth"),
                 map_location="cpu", weights_only=False,
@@ -217,6 +220,12 @@ class TestVSMRSyntheticPipeline(unittest.TestCase):
             trainer._incremental_session(support, 1)
             self.assertEqual(len(trainer.memory), 15)
             self.assertEqual(trainer.classes.tolist(), [0, 1, 2])
+            # Global prototypes and all historical Birth References are immutable.
+            self.assertTrue(torch.equal(trainer.global_prototypes[:2], global_birth))
+            for class_id, reference in prototype_birth.items():
+                self.assertTrue(torch.equal(trainer.prototype_birth[class_id], reference))
+            for sample_id, reference in sample_birth.items():
+                self.assertTrue(torch.equal(trainer.sample_birth[sample_id], reference))
             self.assertIn(2, trainer.prototype_birth)
             self.assertEqual(
                 [n for n, p in trainer.model.named_parameters() if p.requires_grad],
