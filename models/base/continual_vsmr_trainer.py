@@ -426,6 +426,17 @@ class ContinualVSMRFSCILTrainer:
         prototype_reference = torch.stack([
             self.prototype_birth[int(c)].to(self.device) for c in old_classes.tolist()
         ])
+        # The global branch is frozen after Base. Its features and LOO logits
+        # are invariant throughout this Session, so compute them once rather
+        # than repeating the full-memory projection on every Prompt epoch.
+        classes = torch.unique(labels, sorted=True)
+        query_indices = new_indices
+        targets = torch.searchsorted(classes, labels[query_indices])
+        with torch.no_grad():
+            global_features = self.model.context.global_features(cls)
+            global_scores = leave_one_out_cosine_logits(
+                global_features, labels, query_indices, classes, self.logit_scale
+            )
         optimizer = torch.optim.AdamW(
             [prompt],
             lr=float(getattr(self.args, "continual_prompt_lr", 1e-4)),
@@ -451,17 +462,12 @@ class ContinualVSMRFSCILTrainer:
                 local_chunks.append(local)
             local_features = torch.cat(local_chunks, dim=0)
             # New support samples are queries; every seen class is a candidate.
-            query_indices = new_indices
-            classes = torch.unique(labels, sorted=True)
+            # Only local scores depend on the changing Prompt. Global LOO scores
+            # are the precomputed, immutable Base-space scores above.
             local_scores = leave_one_out_cosine_logits(
                 local_features, labels, query_indices, classes, self.logit_scale
             )
-            global_features = self.model.context.global_features(cls)
-            global_scores = leave_one_out_cosine_logits(
-                global_features, labels, query_indices, classes, self.logit_scale
-            )
             joint_scores = self.model.fusion(global_scores, local_scores)
-            targets = torch.searchsorted(classes, labels[query_indices])
             classification_loss = F.cross_entropy(joint_scores, targets)
             rep_loss = cosine_consistency_loss(
                 local_features[historical_indices], sample_reference
